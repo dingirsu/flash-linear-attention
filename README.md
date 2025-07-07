@@ -15,6 +15,7 @@ This repo aims at providing a collection of efficient Triton-based implementatio
 * [News](#news)
 * [Models](#models)
 * [Installation](#installation)
+  * [ARM (aarch64) Support for Triton](#arm-aarch64-support-for-triton)
 * [Usage](#usage)
   * [Token Mixing](#token-mixing)
   * [Fused Modules](#fused-modules)
@@ -28,7 +29,7 @@ This repo aims at providing a collection of efficient Triton-based implementatio
 * [Acknowledgments](#acknowledgments)
 
 ## News
-- **$\texttt{[2025-06]}$:** 🎉 Add Comba implementation to `fla` ([paper](https://arxiv.org/abs/2506.02475)).
+- **$\texttt{[2025-06]}$:** 🐍 Add Comba implementation to `fla` ([paper](https://arxiv.org/abs/2506.02475)).
 - **$\texttt{[2025-05]}$:** 🎉 Add Rodimus&ast; implementation to `fla` ([paper](https://arxiv.org/abs/2410.06577)).
 - **$\texttt{[2025-04]}$:** 🎉 Add DeltaProduct implementation to `fla` ([paper](https://arxiv.org/abs/2502.10297)).
 - **$\texttt{[2025-04]}$:** 🎉 Add FoX implementation to `fla` ([paper](https://arxiv.org/abs/2503.02130)).
@@ -108,6 +109,10 @@ If you have installed `triton-nightly` and `torch` pre version, please use the f
 pip install einops ninja datasets transformers numpy
 pip uninstall flash-linear-attention && pip install -U --no-use-pep517 git+https://github.com/fla-org/flash-linear-attention --no-deps
 ```
+
+### ARM (aarch64) Support for Triton
+
+You need to choose a specific version to install, see [FAQs](FAQs.md)
 
 ## Usage
 
@@ -223,7 +228,7 @@ We offer a collection of fused modules in `fla.modules` to facilitate faster tra
 * [`Norm Layers`](fla/modules/layernorm.py):
   * `RMSNorm`, `LayerNorm` and `GroupNorm`
   * `RMSNormLinear`, `LayerNormLinear` and `GroupNormLinear` to reduce memory usage of intermediate tensors for improved memory efficiency.
-* [`Norm Layers with Gating`](fla/modules/fused_norm_gate.py): combine norm layers with element-wise gating, as used by RetNet/GLA.
+* [`Norm Layers with Gating`](fla/modules/fused_norm_gate.py): combine norm layers with element-wise sigmoid or swish gating, as used by RetNet/GLA.
 * [`Cross Entropy`](fla/modules/fused_cross_entropy.py): faster Triton implementation of cross entropy loss.
 * [`Linear Cross Entropy`](fla/modules/fused_linear_cross_entropy.py): fused linear layer and cross entropy loss to avoid the materialization of large logits tensors. Also refer to implementations by [mgmalek](https://github.com/mgmalek/efficient_cross_entropy) and [Liger-Kernel](https://github.com/linkedin/Liger-Kernel/blob/main/src/liger_kernel/ops/fused_linear_cross_entropy.py).
 * [`Linear KL Divergence`](fla/modules/fused_kl_div.py): fused linear layer and KL divergence loss in a similar vein as CE loss.
