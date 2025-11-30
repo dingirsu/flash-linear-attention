@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional
 
 import torch
 import triton
@@ -9,13 +6,13 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp, gather
-from fla.utils import is_amd, is_gather_supported, use_cuda_graph
+from fla.utils import IS_AMD, IS_GATHER_SUPPORTED, USE_CUDA_GRAPH, autotune_cache_kwargs
 
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [2, 4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -24,7 +21,8 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [2, 4, 8, 16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['BK', 'BT'],
-    use_cuda_graph=use_cuda_graph,
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_dplr_fwd_A_kernel_intra_sub_intra(
@@ -52,7 +50,7 @@ def chunk_dplr_fwd_A_kernel_intra_sub_intra(
     BC: tl.constexpr,
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    GATHER_SUPPORTED: tl.constexpr
+    GATHER_SUPPORTED: tl.constexpr,
 ):
     i_t, i_b, i_h = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
@@ -149,10 +147,10 @@ def chunk_dplr_fwd_intra(
     ge: torch.Tensor,
     scale: float,
     chunk_size: int,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     B, T, H, K = k.shape
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -164,7 +162,7 @@ def chunk_dplr_fwd_intra(
     Aak = q.new_empty(B, T, H, BT, dtype=torch.float)
 
     grid = (NT, B, H)
-    BK = triton.next_power_of_2(K)
+    BK = max(triton.next_power_of_2(K), 16)
     qg = torch.empty_like(q)
     kg = torch.empty_like(k, dtype=q.dtype)
     ag = torch.empty_like(a, dtype=q.dtype)
@@ -193,6 +191,6 @@ def chunk_dplr_fwd_intra(
         BT=BT,
         BC=BT,
         BK=BK,
-        GATHER_SUPPORTED=is_gather_supported
+        GATHER_SUPPORTED=IS_GATHER_SUPPORTED,
     )
     return Aab, Aqk, Aak, Aqb, qg, kg, ag, bg

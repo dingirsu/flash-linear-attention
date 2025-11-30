@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import warnings
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -15,11 +13,11 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cumsum import chunk_local_cumsum
 from fla.ops.utils.op import exp
 from fla.ops.utils.softmax import softmax_bwd, softmax_fwd
-from fla.utils import input_guard
+from fla.utils import autotune_cache_kwargs, input_guard
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -29,7 +27,8 @@ from fla.utils import input_guard
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT']
+    key=['BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gsa_fwd_k_kernel_inter(
@@ -103,7 +102,7 @@ def chunk_gsa_fwd_k_kernel_inter(
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def chunk_gsa_fwd_k_kernel_intra(
@@ -138,7 +137,7 @@ def chunk_gsa_fwd_k_kernel_intra(
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
 
-    if i_t * BT + i_i * BC > T:
+    if i_t * BT + i_i * BC >= T:
         return
 
     p_g = tl.make_block_ptr(g + (bos * H + i_h) * V, (T, V), (H*V, 1), (i_t * BT + i_i * BC, i_v * BV), (BC, BV), (1, 0))
@@ -183,14 +182,15 @@ def chunk_gsa_fwd_k_kernel_intra(
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps)
         for num_warps in [2, 4, 8]
     ],
-    key=["BT"]
+    key=["BT"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gsa_bwd_k_kernel_dA(
@@ -229,7 +229,7 @@ def chunk_gsa_bwd_k_kernel_dA(
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
 
-    if i_t * BT + i_i * BC > T:
+    if i_t * BT + i_i * BC >= T:
         return
 
     p_dA = tl.make_block_ptr(dA+((i_v*all+bos)*HQ+i_hq)*BT, (T, BT), (HQ*BT, 1), (i_t*BT+i_i*BC, i_j*BC), (BC, BC), (1, 0))
@@ -282,7 +282,7 @@ def chunk_gsa_bwd_k_kernel_dA(
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -290,7 +290,8 @@ def chunk_gsa_bwd_k_kernel_dA(
         for num_warps in [2, 4]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT']
+    key=['BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_gsa_bwd_k_kernel_dqkvg(
@@ -416,7 +417,7 @@ def chunk_gsa_bwd_k_kernel_dqkvg(
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.jit(do_not_specialize=['T'])
 def chunk_gsa_bwd_k_kernel_intra_dvg(
@@ -454,7 +455,7 @@ def chunk_gsa_bwd_k_kernel_intra_dvg(
     o_v = i_v * BV + tl.arange(0, BV)
     m_v = o_v < V
 
-    if i_t * BT + i_i * BC > T:
+    if i_t * BT + i_i * BC >= T:
         return
 
     p_gv = tl.make_block_ptr(g + (bos*H+i_h)*V, (T, V), (H*V, 1), (i_t * BT + i_i * BC, i_v * BV), (BC, BV), (1, 0))
@@ -517,11 +518,11 @@ def chunk_gsa_fwd_v(
     v: torch.Tensor,
     g: torch.Tensor,
     scale: float = 1.,
-    initial_state: Optional[torch.Tensor] = None,
+    initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     _, A, h, ht, o = chunk_gla_fwd(
         q=q,
         k=k,
@@ -532,7 +533,7 @@ def chunk_gsa_fwd_v(
         initial_state=initial_state,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     return A, h, ht, o
 
@@ -542,14 +543,14 @@ def chunk_gsa_fwd_k(
     k: torch.Tensor,
     v: torch.Tensor,
     g: torch.Tensor,
-    h0: Optional[torch.Tensor] = None,
+    h0: torch.Tensor | None = None,
     output_final_state: bool = False,
     scale: float = 1.,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     BC = min(16, BT)
     BV = min(64, triton.next_power_of_2(V))
     HQ = q.shape[2]
@@ -569,7 +570,7 @@ def chunk_gsa_fwd_k(
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
         chunk_size=BT,
-        states_in_fp32=False
+        states_in_fp32=False,
     )
     o = v.new_empty(B, T, HQ, V)
     A = q.new_empty(B, T, HQ, BT)
@@ -611,7 +612,7 @@ def chunk_gsa_fwd_k(
         NC=NC,
         NG=NG,
         num_warps=4,
-        num_stages=2
+        num_stages=2,
     )
     return A, h, ht, o
 
@@ -628,8 +629,8 @@ def chunk_gsa_bwd_v(
     dht: torch.Tensor,
     dg: torch.Tensor,
     scale: float = 1.,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ):
     dq, dk, dv, dg, dh0 = chunk_gla_bwd(
         q=q,
@@ -644,7 +645,7 @@ def chunk_gsa_bwd_v(
         do=do,
         dht=dht,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     return dq, dk, dv, dg, dh0
 
@@ -661,11 +662,11 @@ def chunk_gsa_bwd_k(
     dht: torch.Tensor,
     dg: torch.Tensor,
     scale: float = 1.,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     BC = min(16, BT)
     BK = min(64, triton.next_power_of_2(K))
     BV = min(64, triton.next_power_of_2(V))
@@ -689,7 +690,7 @@ def chunk_gsa_bwd_k(
             output_final_state=False,
             cu_seqlens=cu_seqlens,
             chunk_size=BT,
-            states_in_fp32=False
+            states_in_fp32=False,
         )
     dh, dh0 = chunk_bwd_dh(
         q=q,
@@ -704,7 +705,7 @@ def chunk_gsa_bwd_k(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_size=BT,
-        states_in_fp32=True
+        states_in_fp32=True,
     )
     dA = q.new_empty(NV, B, T, HQ, BT)
     grid = (NV, NT * NC * NC, B * HQ)
@@ -789,7 +790,7 @@ def chunk_gsa_bwd_k(
         NC=NC,
         NG=NG,
         num_warps=4,
-        num_stages=2
+        num_stages=2,
     )
     dg = dgv.add_(chunk_local_cumsum(dg, chunk_size=BT, reverse=True, cu_seqlens=cu_seqlens))
 
@@ -802,12 +803,12 @@ def chunk_gsa_fwd(
     v: torch.Tensor,
     s: torch.Tensor,
     g: torch.Tensor,
-    initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None = None,
     output_final_state: bool = False,
     scale: float = 1.,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     hk0, hv0 = None, None
     if initial_state is not None:
         hk0, hv0 = initial_state
@@ -820,7 +821,7 @@ def chunk_gsa_fwd(
         output_final_state=output_final_state,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
 
     # p is kept in fp32 for safe softmax backward
@@ -836,7 +837,7 @@ def chunk_gsa_fwd(
         initial_state=hv0,
         output_final_state=output_final_state,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     return Ak, hk, hkt, ok, p, Av, hv, hvt, ov
 
@@ -849,14 +850,14 @@ def chunk_gsa_bwd(
     g: torch.Tensor,
     ok: torch.Tensor,
     p: torch.Tensor,
-    A: Tuple[torch.Tensor, torch.Tensor],
-    h: Tuple[torch.Tensor, torch.Tensor],
-    initial_state: Optional[Tuple[torch.Tensor, torch.Tensor]],
+    A: tuple[torch.Tensor, torch.Tensor],
+    h: tuple[torch.Tensor, torch.Tensor],
+    initial_state: tuple[torch.Tensor, torch.Tensor] | None,
     scale: float,
     do: torch.Tensor,
-    dht: Tuple[torch.Tensor, torch.Tensor],
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    dht: tuple[torch.Tensor, torch.Tensor],
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ):
     hk0, hv0 = None, None
     if initial_state is not None:
@@ -880,7 +881,7 @@ def chunk_gsa_bwd(
         dg=None,
         scale=1.,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
 
     # softmax gradient, equivalent to:
@@ -900,7 +901,7 @@ def chunk_gsa_bwd(
         dg=dg,
         scale=scale,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
 
     ds = dsv.add_(dsk)
@@ -922,14 +923,13 @@ class ChunkGSAFunction(torch.autograd.Function):
         s: torch.Tensor,
         g: torch.Tensor,
         scale: float,
-        hk0: Optional[torch.Tensor],
-        hv0: Optional[torch.Tensor],
+        hk0: torch.Tensor | None,
+        hv0: torch.Tensor | None,
         output_final_state: bool,
         checkpoint_level: int,
-        cu_seqlens: Optional[torch.LongTensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        T = q.shape[1]
-        chunk_size = min(64, max(16, triton.next_power_of_2(T)))
+        cu_seqlens: torch.LongTensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        chunk_size = min(64, max(16, triton.next_power_of_2(q.shape[1])))
 
         g_org, g = g, chunk_local_cumsum(g, chunk_size, cu_seqlens=cu_seqlens)
         Ak, hk, hkt, ok, p, Av, hv, hvt, ov = chunk_gsa_fwd(
@@ -942,7 +942,7 @@ class ChunkGSAFunction(torch.autograd.Function):
             output_final_state=output_final_state,
             scale=scale,
             cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
         )
 
         if checkpoint_level >= 1:
@@ -987,7 +987,7 @@ class ChunkGSAFunction(torch.autograd.Function):
             do=dov,
             dht=(dhkt, dhvt),
             cu_seqlens=cu_seqlens,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
         )
         return dq, dk, dv, ds, dg, None, dhk0, dhv0, None, None, None, None
 
@@ -998,14 +998,14 @@ def chunk_gsa(
     k: torch.Tensor,
     v: torch.Tensor,
     s: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    scale: Optional[int] = None,
-    initial_state: Optional[Tuple[torch.Tensor]] = None,
-    output_final_state: Optional[bool] = False,
-    checkpoint_level: Optional[int] = 2,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: Optional[bool] = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    g: torch.Tensor | None = None,
+    scale: int | None = None,
+    initial_state: tuple[torch.Tensor] | None = None,
+    output_final_state: bool | None = False,
+    checkpoint_level: int | None = 2,
+    cu_seqlens: torch.LongTensor | None = None,
+    head_first: bool | None = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
@@ -1085,25 +1085,25 @@ def chunk_gsa(
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead."
+            "Please use head_first=False for now instead.",
         )
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
             "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
             "when head_first=False was specified. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
         )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
+                f"Please flatten variable-length inputs before processing.",
             )
         if initial_state is not None and initial_state[0].shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state[0].shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {initial_state[0].shape[0]}.",
             )
     assert checkpoint_level in [0, 1, 2]
     if g is None:
@@ -1128,6 +1128,6 @@ def chunk_gsa(
         hv0,
         output_final_state,
         checkpoint_level,
-        cu_seqlens
+        cu_seqlens,
     )
     return o, final_state

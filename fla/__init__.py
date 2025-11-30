@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 from fla.layers import (
     ABCAttention,
@@ -6,6 +5,7 @@ from fla.layers import (
     BasedLinearAttention,
     BitAttention,
     Comba,
+    DeltaFormerAttention,
     DeltaNet,
     GatedDeltaNet,
     GatedDeltaProduct,
@@ -15,14 +15,17 @@ from fla.layers import (
     HGRNAttention,
     LightNetAttention,
     LinearAttention,
+    LogLinearMamba2,
     MesaNet,
+    MomAttention,
+    MultiheadLatentAttention,
     MultiScaleRetention,
     NativeSparseAttention,
     PaTHAttention,
     ReBasedLinearAttention,
     RodimusAttention,
     RWKV6Attention,
-    RWKV7Attention
+    RWKV7Attention,
 )
 from fla.models import (
     ABCForCausalLM,
@@ -31,6 +34,8 @@ from fla.models import (
     BitNetModel,
     CombaForCausalLM,
     CombaModel,
+    DeltaFormerForCausalLM,
+    DeltaFormerModel,
     DeltaNetForCausalLM,
     DeltaNetModel,
     GatedDeltaNetForCausalLM,
@@ -49,8 +54,14 @@ from fla.models import (
     LightNetModel,
     LinearAttentionForCausalLM,
     LinearAttentionModel,
+    LogLinearMamba2ForCausalLM,
+    LogLinearMamba2Model,
     MesaNetForCausalLM,
     MesaNetModel,
+    MLAForCausalLM,
+    MLAModel,
+    MomForCausalLM,
+    MomModel,
     NSAForCausalLM,
     NSAModel,
     PaTHAttentionForCausalLM,
@@ -64,7 +75,7 @@ from fla.models import (
     RWKV7ForCausalLM,
     RWKV7Model,
     TransformerForCausalLM,
-    TransformerModel
+    TransformerModel,
 )
 
 __all__ = [
@@ -74,6 +85,7 @@ __all__ = [
     'BitAttention', 'BitNetForCausalLM', 'BitNetModel',
     'Comba', 'CombaForCausalLM', 'CombaModel',
     'DeltaNet', 'DeltaNetForCausalLM', 'DeltaNetModel',
+    'DeltaFormerAttention', 'DeltaFormerForCausalLM', 'DeltaFormerModel',
     'GatedDeltaNet', 'GatedDeltaNetForCausalLM', 'GatedDeltaNetModel',
     'GatedDeltaProduct', 'GatedDeltaProductForCausalLM', 'GatedDeltaProductModel',
     'GatedLinearAttention', 'GLAForCausalLM', 'GLAModel',
@@ -82,7 +94,10 @@ __all__ = [
     'HGRN2Attention', 'HGRN2ForCausalLM', 'HGRN2Model',
     'LightNetAttention', 'LightNetForCausalLM', 'LightNetModel',
     'LinearAttention', 'LinearAttentionForCausalLM', 'LinearAttentionModel',
+    'LogLinearMamba2', 'LogLinearMamba2ForCausalLM', 'LogLinearMamba2Model',
     'MesaNet', 'MesaNetForCausalLM', 'MesaNetModel',
+    'MomAttention', 'MomForCausalLM', 'MomModel',
+    'MultiheadLatentAttention', 'MLAForCausalLM', 'MLAModel',
     'MultiScaleRetention', 'RetNetForCausalLM', 'RetNetModel',
     'NativeSparseAttention', 'NSAForCausalLM', 'NSAModel',
     'PaTHAttention', 'PaTHAttentionForCausalLM', 'PaTHAttentionModel',
@@ -92,4 +107,4 @@ __all__ = [
     'RWKV7Attention', 'RWKV7ForCausalLM', 'RWKV7Model',
 ]
 
-__version__ = '0.3.0'
+__version__ = '0.4.1'

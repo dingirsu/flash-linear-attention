@@ -1,15 +1,12 @@
-# -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import math
 import warnings
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
-import torch.utils.checkpoint
-from transformers.generation import GenerationMixin
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
@@ -18,19 +15,25 @@ from transformers.utils.deprecation import deprecate_kwarg
 from fla.layers.attn import Attention
 from fla.layers.mesa_net import MesaNet
 from fla.models.mesa_net.configuration_mesa_net import MesaNetConfig
-from fla.models.utils import Cache
-from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss
+from fla.models.utils import Cache, FLAGenerationMixin
+from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from fla.modules import GatedMLP as MesaNetMLP
-from fla.modules import RMSNorm
 from fla.modules.l2warp import l2_warp
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
 
+
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    from fla.models.modeling_layers import GradientCheckpointingLayer
+
 logger = logging.get_logger(__name__)
 
 
-class MesaNetBlock(nn.Module):
+class MesaNetBlock(GradientCheckpointingLayer):
+
     def __init__(self, config: MesaNetConfig, layer_idx: int):
         super().__init__()
 
@@ -47,7 +50,7 @@ class MesaNetBlock(nn.Module):
                 window_size=config.attn['window_size'],
                 rope_theta=config.attn['rope_theta'],
                 max_position_embeddings=config.max_position_embeddings,
-                layer_idx=layer_idx
+                layer_idx=layer_idx,
             )
         else:
             self.attn = MesaNet(
@@ -55,14 +58,14 @@ class MesaNetBlock(nn.Module):
                 hidden_size=config.hidden_size,
                 num_heads=config.num_heads,
                 head_dim=config.head_dim,
-                use_gate=config.use_gate,
+                use_output_gate=config.use_output_gate,
                 use_short_conv=config.use_short_conv,
                 conv_size=config.conv_size,
                 norm_eps=config.norm_eps,
                 lambda_lower_bound=config.lambda_lower_bound,
                 layer_idx=layer_idx,
                 max_cg_step_training=config.max_cg_step_training,
-                max_cg_step_decoding=config.max_cg_step_decoding
+                max_cg_step_decoding=config.max_cg_step_decoding,
             )
         self.mlp_norm = (RMSNorm if config.fuse_norm else nn.RMSNorm)(config.hidden_size, eps=config.norm_eps)
         self.mlp = MesaNetMLP(
@@ -70,18 +73,18 @@ class MesaNetBlock(nn.Module):
             hidden_ratio=config.hidden_ratio,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
-            fuse_swiglu=config.fuse_swiglu
+            fuse_swiglu=config.fuse_swiglu,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        **kwargs: Unpack[Dict]
-    ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.FloatTensor, tuple[torch.FloatTensor, torch.FloatTensor] | None]:
         residual = hidden_states
         hidden_states = self.attn_norm(hidden_states)
         hidden_states, attentions, past_key_values = self.attn(
@@ -90,7 +93,7 @@ class MesaNetBlock(nn.Module):
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
-            **kwargs
+            **kwargs,
         )
         if self.config.fuse_norm:
             hidden_states, residual = self.mlp_norm(hidden_states, residual, True)
@@ -120,7 +123,7 @@ class MesaNetPreTrainedModel(PreTrainedModel):
     def _init_weights(
         self,
         module: nn.Module,
-        prenorm_residual_strategy: Optional[str] = None,
+        prenorm_residual_strategy: str | None = None,
         num_residuals_per_layer: int = 2,
     ):
         if isinstance(module, (nn.Linear, nn.Conv1d)):
@@ -184,16 +187,16 @@ class MesaNetModel(MesaNetPreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
+        input_ids: torch.LongTensor | None = None,
         attention_mask: Optional[torch.Tensor] = None,  # noqa
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs: Unpack[Dict]
-    ) -> Union[Tuple, BaseModelOutputWithPast]:
+        inputs_embeds: torch.FloatTensor | None = None,
+        past_key_values: Cache | list[torch.FloatTensor] | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        **kwargs: Unpack[dict],
+    ) -> tuple | BaseModelOutputWithPast:
         if output_attentions:
             warnings.warn("`MesaNetModel` does not `output_attentions` now, setting it to `False`.")
             output_attentions = False
@@ -215,35 +218,20 @@ class MesaNetModel(MesaNetPreTrainedModel):
         if use_cache and not isinstance(past_key_values, Cache):
             past_key_values = Cache.from_legacy_cache(past_key_values)
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            logger.warning_once("`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`...")
-            use_cache = False
-
         all_hidden_states = () if output_hidden_states else None
         all_attns = () if output_attentions else None
         for layer in self.layers:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
 
-            if self.gradient_checkpointing and self.training:
-                hidden_states, attentions, past_key_values = self._gradient_checkpointing_func(
-                    layer.__call__,
-                    hidden_states,
-                    attention_mask,
-                    past_key_values,
-                    use_cache,
-                    output_attentions,
-                    **kwargs
-                )
-            else:
-                hidden_states, attentions, past_key_values = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_values=past_key_values,
-                    use_cache=use_cache,
-                    output_attentions=output_attentions,
-                    **kwargs
-                )
+            hidden_states, attentions, past_key_values = layer(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
 
             if output_attentions:
                 all_attns += (attentions,)
@@ -260,11 +248,11 @@ class MesaNetModel(MesaNetPreTrainedModel):
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
             hidden_states=all_hidden_states,
-            attentions=all_attns
+            attentions=all_attns,
         )
 
 
-class MesaNetForCausalLM(MesaNetPreTrainedModel, GenerationMixin):
+class MesaNetForCausalLM(MesaNetPreTrainedModel, FLAGenerationMixin):
 
     _tied_weights_keys = ["lm_head.weight"]
 
@@ -306,60 +294,26 @@ class MesaNetForCausalLM(MesaNetPreTrainedModel, GenerationMixin):
                     f"which is not supported for {self.__class__.__name__}. "
                     f"Try another generation strategy instead. "
                     f"For the available generation strategies, check this doc: "
-                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies"
+                    f"https://huggingface.co/docs/transformers/en/generation_strategies#decoding-strategies",
                 )
             else:
                 raise exception
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
-    def prepare_inputs_for_generation(
-        self,
-        input_ids: torch.LongTensor = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        use_cache: bool = True,
-        logits_to_keep: Optional[int] = None,
-        **kwargs
-    ):
-        # only last token for `inputs_ids` if the `past_key_values` is not empty.
-        if past_key_values is not None and len(past_key_values) > 0:
-            input_ids = input_ids[:, -1:]
-        # if `inputs_embeds` are passed, we only want to use them in the 1st generation step
-        if inputs_embeds is not None and len(past_key_values) == 0:
-            model_inputs = {'inputs_embeds': inputs_embeds}
-        else:
-            # The `contiguous()` here is necessary to have a static stride during decoding. torchdynamo otherwise
-            # recompiles graphs as the stride of the inputs is a guard.
-            # Ref: https://github.com/huggingface/transformers/pull/29114
-            # TODO: use `next_tokens` directly instead.
-            model_inputs = {'input_ids': input_ids.contiguous()}
-
-        if logits_to_keep is not None:
-            model_inputs['logits_to_keep'] = logits_to_keep
-
-        model_inputs.update({
-            'past_key_values': past_key_values,
-            'use_cache': use_cache,
-            'attention_mask': attention_mask,
-        })
-        return model_inputs
-
-    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def forward(
         self,
         input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Union[Cache, List[torch.FloatTensor]]] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        logits_to_keep: Optional[int] = 0,
-        **kwargs: Unpack[Dict]
-    ) -> Union[Tuple, CausalLMOutputWithPast]:
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        past_key_values: Cache | list[torch.FloatTensor] | None = None,
+        labels: torch.LongTensor | None = None,
+        use_cache: bool | None = None,
+        output_attentions: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        logits_to_keep: int | None = 0,
+        **kwargs: Unpack[dict],
+    ) -> tuple | CausalLMOutputWithPast:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -375,18 +329,17 @@ class MesaNetForCausalLM(MesaNetPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
-            **kwargs
+            **kwargs,
         )
 
         hidden_states = outputs[0]
-        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training and labels is not None
 
         loss, logits = None, None
-        if not fuse_linear_and_cross_entropy or labels is None:
+        if not self.config.fuse_linear_cross_entropy or labels is None:
             logits = self.lm_head(hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:])
         if labels is not None:
             if getattr(self, 'criterion', None) is None:
-                if fuse_linear_and_cross_entropy:
+                if self.config.fuse_linear_cross_entropy:
                     criterion = FusedLinearCrossEntropyLoss(use_l2warp=self.config.use_l2warp)
                 elif self.config.fuse_cross_entropy:
                     criterion = FusedCrossEntropyLoss(inplace_backward=True)
@@ -396,7 +349,7 @@ class MesaNetForCausalLM(MesaNetPreTrainedModel, GenerationMixin):
                 criterion = self.criterion
             labels = labels.to(hidden_states.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
-            if fuse_linear_and_cross_entropy:
+            if self.config.fuse_linear_cross_entropy:
                 loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))

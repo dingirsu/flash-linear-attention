@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 
 import os
-from typing import List
 
 import pytest
 import torch
@@ -26,11 +24,11 @@ from fla.utils import assert_close, device, device_platform
             (2, 1024, 8, 128, 0.1, torch.float16),
             (2, 1024, 8, 128, 10, torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     device_platform == 'intel',
-    reason='Intel Triton Failure'
+    reason='Intel Triton Failure',
 )
 def test_fused_recurrent(
     B: int,
@@ -38,7 +36,7 @@ def test_fused_recurrent(
     H: int,
     D: int,
     gate_logit_normalizer: float,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
 
@@ -56,7 +54,7 @@ def test_fused_recurrent(
         v=v,
         gk=g,
         initial_state=h0,
-        output_final_state=True
+        output_final_state=True,
     )
     ((ref * do).sum() + (ref_ht * dht).sum()).backward()
     ref_dq, q.grad = q.grad.clone(), None
@@ -71,7 +69,7 @@ def test_fused_recurrent(
         v=v,
         gk=g,
         initial_state=h0,
-        output_final_state=True
+        output_final_state=True,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_dq, q.grad = q.grad.clone(), None
@@ -100,17 +98,17 @@ def test_fused_recurrent(
             (4, 64, [0, 1, 100, 300, 1200, 2048], torch.float16),
             (4, 128, [0, 200, 512, 1200, 2048], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     device_platform == 'intel',
-    reason='Intel Triton Failure'
+    reason='Intel Triton Failure',
 )
 def test_fused_recurrent_varlen(
     H: int,
     D: int,
-    cu_seqlens: List[int],
-    dtype: torch.dtype
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
 
@@ -134,7 +132,7 @@ def test_fused_recurrent_varlen(
             v=v[:, cu_seqlens[i]:cu_seqlens[i+1]],
             gk=g[:, cu_seqlens[i]:cu_seqlens[i+1]],
             initial_state=h0[i],
-            output_final_state=True
+            output_final_state=True,
         )
         refs.append(ref)
         ref_hts.append(ref_ht)
@@ -155,7 +153,7 @@ def test_fused_recurrent_varlen(
         gk=g,
         initial_state=h0,
         output_final_state=True,
-        cu_seqlens=cu_seqlens
+        cu_seqlens=cu_seqlens,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_dq, q.grad = q.grad.clone(), None
@@ -183,13 +181,13 @@ def test_fused_recurrent_varlen(
             (2, 1024, 8, 128, 0.1, torch.float16),
             (2, 1024, 8, 128, 1, torch.float16),
             (2, 1024, 8, 128, 10, torch.float16),
-            (4, 2048, 8, 64, 1, torch.float16)
+            (4, 2048, 8, 64, 1, torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     device_platform == 'intel',
-    reason='Intel Triton Failure'
+    reason='Intel Triton Failure',
 )
 def test_chunk(
     B: int,
@@ -206,9 +204,9 @@ def test_chunk(
     k = torch.rand((B, T, H, D), dtype=dtype, device=device).requires_grad_()
     v = torch.rand((B, T, H, D), dtype=dtype, device=device).requires_grad_()
     g = (F.logsigmoid(torch.rand((B, T, H, D), dtype=dtype, device=device)) / gate_logit_normalizer).requires_grad_()
-    h0 = torch.rand((B, H, D, D), dtype=dtype, device=device).requires_grad_()
+    h0 = torch.rand((B, H, D, D), dtype=torch.float32, device=device).requires_grad_()
     do = torch.randn_like(v)
-    dht = torch.randn((B, H, D, D), dtype=dtype, device=device)
+    dht = torch.randn((B, H, D, D), dtype=torch.float32, device=device)
 
     tri, tri_ht = chunk_gla(
         q=q,
@@ -218,7 +216,7 @@ def test_chunk(
         initial_state=h0,
         output_final_state=True,
     )
-    ((tri * do).sum() + (tri_ht * dht).sum()).backward()
+    ((tri * do).sum() + (tri_ht * dht).sum().to(do.dtype)).backward()
     tri_dq, q.grad = q.grad.clone(), None
     tri_dk, k.grad = k.grad.clone(), None
     tri_dv, v.grad = v.grad.clone(), None
@@ -258,16 +256,16 @@ def test_chunk(
             (4, 64, [0, 256, 500, 1000], torch.float16),
             (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
-    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set'
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
 def test_chunk_varlen(
     H: int,
     D: int,
-    cu_seqlens: List[int],
+    cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -281,9 +279,9 @@ def test_chunk_varlen(
     k = torch.rand((1, T, H, D), dtype=dtype, device=device).requires_grad_()
     v = torch.rand((1, T, H, D), dtype=dtype, device=device).requires_grad_()
     g = F.logsigmoid(torch.rand((1, T, H, D), dtype=dtype, device=device)).requires_grad_()
-    h0 = torch.rand((N, H, D, D), dtype=dtype, device=device).requires_grad_()
+    h0 = torch.rand((N, H, D, D), dtype=torch.float32, device=device).requires_grad_()
     do = torch.randn_like(v)
-    dht = torch.rand((N, H, D, D), dtype=dtype, device=device)
+    dht = torch.rand((N, H, D, D), dtype=torch.float32, device=device)
 
     ref, ref_ht = fused_recurrent_gla(
         q=q,
@@ -292,10 +290,10 @@ def test_chunk_varlen(
         gk=g,
         initial_state=h0,
         output_final_state=True,
-        cu_seqlens=cu_seqlens
+        cu_seqlens=cu_seqlens,
     )
 
-    ((ref * do).sum() + (ref_ht * dht).sum()).backward()
+    ((ref * do).sum() + (ref_ht * dht).sum().to(do.dtype)).backward()
     ref_dq, q.grad = q.grad.clone(), None
     ref_dk, k.grad = k.grad.clone(), None
     ref_dv, v.grad = v.grad.clone(), None
@@ -309,7 +307,7 @@ def test_chunk_varlen(
         g=g,
         initial_state=h0,
         output_final_state=True,
-        cu_seqlens=cu_seqlens
+        cu_seqlens=cu_seqlens,
     )
     ((tri * do).sum() + (tri_ht * dht).sum()).backward()
     tri_dq, q.grad = q.grad.clone(), None

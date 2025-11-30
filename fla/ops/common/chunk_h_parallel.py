@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 """
 Fully parallelized state passing.
 """
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -13,12 +11,13 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 from fla.ops.utils.op import exp
+from fla.utils import autotune_cache_kwargs
 
 
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -28,7 +27,8 @@ from fla.ops.utils.op import exp
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_h_parallel(
@@ -54,7 +54,7 @@ def chunk_fwd_kernel_h_parallel(
     USE_GV: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
@@ -132,7 +132,7 @@ def chunk_fwd_kernel_h_parallel(
 
 @triton.heuristics({
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -142,7 +142,8 @@ def chunk_fwd_kernel_h_parallel(
         for num_warps in [2, 4, 8, 16]
         for num_stages in [2, 3]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_h_reduction(
@@ -165,7 +166,7 @@ def chunk_fwd_kernel_h_reduction(
     USE_GK: tl.constexpr,
     USE_GV: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_h = i_nh // H, i_nh % H
@@ -217,7 +218,7 @@ def chunk_fwd_kernel_h_reduction(
 @triton.heuristics({
     'STORE_INITIAL_STATE_GRADIENT': lambda args: args['dh0'] is not None,
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -227,7 +228,8 @@ def chunk_fwd_kernel_h_reduction(
         for num_warps in [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dh_parallel(
@@ -256,7 +258,7 @@ def chunk_bwd_kernel_dh_parallel(
     USE_GV: tl.constexpr,
     STORE_INITIAL_STATE_GRADIENT: tl.constexpr,
     USE_FINAL_STATE_GRADIENT: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
 
@@ -320,7 +322,7 @@ def chunk_bwd_kernel_dh_parallel(
 
 @triton.heuristics({
     'STORE_INITIAL_STATE_GRADIENT': lambda args: args['dh0'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -330,7 +332,8 @@ def chunk_bwd_kernel_dh_parallel(
         for num_warps in [2, 4, 8, 16]
         for num_stages in [2, 3]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dh_reduction(
@@ -355,7 +358,7 @@ def chunk_bwd_kernel_dh_reduction(
     USE_GK: tl.constexpr,
     USE_GV: tl.constexpr,
     STORE_INITIAL_STATE_GRADIENT: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
@@ -409,11 +412,11 @@ def chunk_fwd_h(
     h0: torch.Tensor,
     output_final_state: bool,
     states_in_fp32: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    chunk_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -443,7 +446,7 @@ def chunk_fwd_h(
         BT=BT,
         USE_G=g is not None,
         USE_GK=gk is not None,
-        USE_GV=gv is not None
+        USE_GV=gv is not None,
     )
     kvt, ht = ht, (torch.empty_like(ht) if output_final_state else None)
     def grid(meta): return (triton.cdiv(K, meta['BK']), triton.cdiv(V, meta['BV']), N * H)
@@ -463,7 +466,7 @@ def chunk_fwd_h(
         BT=BT,
         USE_G=g is not None,
         USE_GK=gk is not None,
-        USE_GV=gv is not None
+        USE_GV=gv is not None,
     )
     h = h.to(k.dtype) if not states_in_fp32 else h
     return h, ht
@@ -481,12 +484,12 @@ def chunk_bwd_dh(
     dht: torch.Tensor,
     scale: float,
     states_in_fp32: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
-    chunk_size: int = 64
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.Tensor | None = None,
+    chunk_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     # N: the actual number of sequences in the batch with either equal or variable lengths
@@ -522,7 +525,7 @@ def chunk_bwd_dh(
         NG=NG,
         USE_G=g is not None,
         USE_GK=gk is not None,
-        USE_GV=gv is not None
+        USE_GV=gv is not None,
     )
 
     doq0, dh0 = dh0, (torch.empty_like(dh0) if dh0 is not None else None)
@@ -545,7 +548,7 @@ def chunk_bwd_dh(
         NG=NG,
         USE_G=g is not None,
         USE_GK=gk is not None,
-        USE_GV=gv is not None
+        USE_GV=gv is not None,
     )
     dh = dh.to(q.dtype) if not states_in_fp32 else dh
     return dh, dh0

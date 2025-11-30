@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -9,16 +6,16 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import check_shared_mem, is_nvidia_hopper
+from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -27,6 +24,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         triton.Config({'BK': 32, 'BV': 32}, num_warps=2, num_stages=3),
     ],
     key=['H', 'K', 'V', 'BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_o(
@@ -132,23 +130,23 @@ def chunk_fwd_kernel_o(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA', 'USE_DW'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dqkwg(
     q,
     k,
     v,
-    h,
     g,
     g_gamma,
+    h,
     do,
     dh,
     dq,
     dk,
-    dg,
-    w,
-    dv,
     dw,
+    dv,
+    dg,
     cu_seqlens,
     chunk_indices,
     scale,
@@ -167,18 +165,18 @@ def chunk_bwd_kernel_dqkwg(
 ):
     i_k, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
+
+    all = B * T
     if IS_VARLEN:
         i_tg = i_t
         i_n, i_t = tl.load(chunk_indices + i_t * 2).to(tl.int32), tl.load(chunk_indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
-        all = T
         T = eos - bos
         NT = tl.cdiv(T, BT)
     else:
         NT = tl.cdiv(T, BT)
         i_tg = i_b * NT + i_t
         bos, eos = i_b * T, i_b * T + T
-        all = B * T
 
     # offset calculation
     v += (bos * H + i_h) * V
@@ -192,13 +190,12 @@ def chunk_bwd_kernel_dqkwg(
 
     # for delta rule only
     if USE_DW:
-        w += (bos * H + i_h) * K
         dw += (bos * H + i_h) * K
         dv += (bos * H + i_h) * V
 
     if USE_G:
         dg += i_k * all * H
-        b_dg_last = tl.zeros([1,], dtype=tl.float32) if USE_G else None
+        b_dg_last = tl.zeros([1], dtype=tl.float32) if USE_G else None
     if USE_G_GAMMA:
         b_gamma = tl.load(g_gamma + i_h)
         b_g = b_gamma * (tl.arange(0, BT) + 1)
@@ -249,7 +246,7 @@ def chunk_bwd_kernel_dqkwg(
     m_t = o_t < T
     m_A = (o_t[:, None] >= o_t[None, :]) & (m_t[:, None] & m_t)
     if USE_G:
-        b_dg = tl.zeros([BT,], dtype=tl.float32)
+        b_dg = tl.zeros([BT], dtype=tl.float32)
         g += bos * H + i_h
         dg += bos * H + i_h
         p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
@@ -314,6 +311,7 @@ def chunk_bwd_kernel_dqkwg(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G', 'USE_G_GAMMA'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dv(
@@ -399,6 +397,7 @@ def chunk_bwd_kernel_dv(
 @triton.heuristics({
     'USE_G': lambda args: args['g'] is not None,
     'USE_G_GAMMA': lambda args: args['g_gamma'] is not None,
+    'USE_A': lambda args: args['A'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
@@ -408,6 +407,7 @@ def chunk_bwd_kernel_dv(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'USE_G'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dv_local(
@@ -415,6 +415,7 @@ def chunk_bwd_kernel_dv_local(
     k,
     g,
     g_gamma,
+    A,
     do,
     dv,
     cu_seqlens,
@@ -429,6 +430,7 @@ def chunk_bwd_kernel_dv_local(
     BV: tl.constexpr,
     USE_G: tl.constexpr,
     USE_G_GAMMA: tl.constexpr,
+    USE_A: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -446,29 +448,33 @@ def chunk_bwd_kernel_dv_local(
     do += (bos * H + i_h) * V
     dv += (bos * H + i_h) * V
 
-    b_A = tl.zeros([BT, BT], dtype=tl.float32)
-    for i_k in range(tl.cdiv(K, BK)):
-        p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
-        p_q = tl.make_block_ptr(q, (K, T), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
-        b_q = tl.load(p_q, boundary_check=(0, 1))
-        b_k = tl.load(p_k, boundary_check=(0, 1))
-        b_A += tl.dot(b_k, b_q)
+    if USE_A:
+        p_A = tl.make_block_ptr(A + (bos * H + i_h) * BT, (BT, T), (1, H*BT), (0, i_t * BT), (BT, BT), (0, 1))
+        b_A = tl.load(p_A, boundary_check=(0, 1))
+    else:
+        if USE_G:
+            g += bos * H + i_h
+            p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
+            b_g = tl.load(p_g, boundary_check=(0,))
+        if USE_G_GAMMA:
+            b_gamma = tl.load(g_gamma + i_h)
+            b_g = b_gamma * (tl.arange(0, BT) + 1)
 
-    if USE_G:
-        g += bos * H + i_h
-        p_g = tl.make_block_ptr(g, (T,), (H,), (i_t * BT,), (BT,), (0,))
-        b_g = tl.load(p_g, boundary_check=(0,))
-    if USE_G_GAMMA:
-        b_gamma = tl.load(g_gamma + i_h)
-        b_g = b_gamma * (tl.arange(0, BT) + 1)
+        b_A = tl.zeros([BT, BT], dtype=tl.float32)
+        for i_k in range(tl.cdiv(K, BK)):
+            p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, i_k * BK), (BT, BK), (1, 0))
+            p_q = tl.make_block_ptr(q, (K, T), (1, H*K), (i_k * BK, i_t * BT), (BK, BT), (0, 1))
+
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_q = tl.load(p_q, boundary_check=(0, 1))
+            b_A += tl.dot(b_k, b_q) * scale
+        if USE_G or USE_G_GAMMA:
+            b_A *= exp(b_g[None, :] - b_g[:, None])
 
     o_t = i_t * BT + tl.arange(0, BT)
     m_t = o_t < T
     m_A = (o_t[:, None] <= o_t[None, :]) & (m_t[:, None] & m_t)
-    if USE_G:
-        b_A = tl.where(m_A, b_A * exp(b_g[None, :] - b_g[:, None]) * scale, 0).to(do.dtype.element_ty)
-    else:
-        b_A = tl.where(m_A, b_A * scale, 0).to(do.dtype.element_ty)
+    b_A = tl.where(m_A, b_A, 0).to(do.dtype.element_ty)
 
     for i_v in range(tl.cdiv(V, BV)):
         p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
@@ -483,14 +489,14 @@ def chunk_fwd_o(
     k: torch.Tensor,
     v: torch.Tensor,
     h: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, H, K, V = *q.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if scale is None:
@@ -523,14 +529,14 @@ def chunk_bwd_dv(
     k: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, do.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     # H100 can have larger block size
     if check_shared_mem('hopper', k.device.index):
@@ -539,8 +545,8 @@ def chunk_bwd_dv(
         CONST_TILING = 64
     else:
         CONST_TILING = 32
-    BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(V), CONST_TILING)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     NV = triton.cdiv(V, BV)
     if scale is None:
@@ -574,15 +580,18 @@ def chunk_bwd_dv_local(
     q: torch.Tensor,
     k: torch.Tensor,
     do: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    A: torch.Tensor | None = None,
     scale: float = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
+    chunk_indices: torch.LongTensor | None = None,
 ) -> torch.Tensor:
     B, T, H, K, V = *k.shape, do.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
+    BT = chunk_size
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     # H100 can have larger block size
     if check_shared_mem('hopper', k.device.index):
         CONST_TILING = 128
@@ -590,8 +599,8 @@ def chunk_bwd_dv_local(
         CONST_TILING = 64
     else:
         CONST_TILING = 32
-    BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(V), CONST_TILING)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     dv = torch.empty_like(do)
@@ -601,6 +610,7 @@ def chunk_bwd_dv_local(
         k=k,
         g=g,
         g_gamma=g_gamma,
+        A=A,
         do=do,
         dv=dv,
         cu_seqlens=cu_seqlens,
@@ -624,23 +634,23 @@ def chunk_bwd_dqkwg(
     do: torch.Tensor,
     h: torch.Tensor,
     dh: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    dv: Optional[torch.Tensor] = None,
-    w: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    w: torch.Tensor | None = None,
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    dv: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
-    scale: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(V), CONST_TILING)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
@@ -652,16 +662,15 @@ def chunk_bwd_dqkwg(
         q=q,
         k=k,
         v=v,
-        h=h,
         g=g,
         g_gamma=g_gamma,
+        h=h,
         do=do,
         dh=dh,
-        dv=dv,
-        w=w,
         dw=dw,
         dq=dq,
         dk=dk,
+        dv=dv,
         dg=dg,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,

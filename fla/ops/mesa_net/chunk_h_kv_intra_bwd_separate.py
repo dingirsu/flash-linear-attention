@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
@@ -7,9 +6,9 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import is_nvidia_hopper
+from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs
 
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
 @triton.heuristics({
@@ -22,6 +21,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_mesa_net_h_kv_bwd_intra_kernel_dkv(
@@ -80,8 +80,8 @@ def chunk_mesa_net_h_kv_bwd_intra_kernel_dkv(
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     b_ds = tl.zeros([BT, BT], dtype=tl.float32)
     b_dv = tl.zeros([BT, BK], dtype=tl.float32)
-    b_dg_last = tl.zeros([1,], dtype=tl.float32)
-    b_dg = tl.zeros([BT,], dtype=tl.float32)
+    b_dg_last = tl.zeros([1], dtype=tl.float32)
+    b_dg = tl.zeros([BT], dtype=tl.float32)
 
     p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
     p_k = tl.make_block_ptr(k, (T, K), (H*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
@@ -140,6 +140,7 @@ def chunk_mesa_net_h_kv_bwd_intra_kernel_dkv(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_mesa_net_h_kv_bwd_intra_kernel_dq(
@@ -237,15 +238,15 @@ def chunk_mesa_net_h_kv_bwd_intra_separate_fn(
     g,
     do,
     cu_seqlens,
-    chunk_size=64
+    chunk_size=64,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BK = triton.next_power_of_2(K)
-    BV = triton.next_power_of_2(V)
+    BK = max(triton.next_power_of_2(K), 16)
+    BV = max(triton.next_power_of_2(V), 16)
     dq = torch.empty_like(q_star, dtype=torch.float32)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
@@ -272,7 +273,7 @@ def chunk_mesa_net_h_kv_bwd_intra_separate_fn(
         V=V,
         BT=BT,
         BK=BK,
-        BV=BV
+        BV=BV,
     )
     dg_final = torch.empty_like(dg)
     chunk_mesa_net_h_kv_bwd_intra_kernel_dq[grid](
@@ -295,6 +296,6 @@ def chunk_mesa_net_h_kv_bwd_intra_separate_fn(
         V=V,
         BT=BT,
         BK=BK,
-        BV=BV
+        BV=BV,
     )
     return dq, dk, dv, dg_final

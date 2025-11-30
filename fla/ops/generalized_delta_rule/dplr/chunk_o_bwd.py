@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -9,15 +6,15 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.op import exp
-from fla.utils import check_shared_mem, is_amd, use_cuda_graph
+from fla.utils import IS_AMD, USE_CUDA_GRAPH, autotune_cache_kwargs, check_shared_mem
 
-NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if is_amd else [2, 4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [2, 4, 8, 16, 32]
 
 BK_LIST = [32, 64, 128] if check_shared_mem() else [16, 32]
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -26,7 +23,8 @@ BK_LIST = [32, 64, 128] if check_shared_mem() else [16, 32]
         for num_stages in [2, 3, 4]
     ],
     key=['BV', 'BT'],
-    use_cuda_graph=use_cuda_graph,
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_dplr_bwd_kernel_dAu(
@@ -98,7 +96,8 @@ def chunk_dplr_bwd_kernel_dAu(
         for num_stages in [2, 3, 4]
     ],
     key=['BT', 'BK', 'BV'],
-    use_cuda_graph=use_cuda_graph,
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def chunk_dplr_bwd_o_kernel(
@@ -227,7 +226,8 @@ def chunk_dplr_bwd_o_kernel(
         for BV in BK_LIST
     ],
     key=['BT'],
-    use_cuda_graph=use_cuda_graph,
+    use_cuda_graph=USE_CUDA_GRAPH,
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def chunk_dplr_bwd_kernel_dv(
@@ -294,11 +294,11 @@ def chunk_dplr_bwd_dv(
     kg: torch.Tensor,
     do: torch.Tensor,
     dh: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, H, K, V = *kg.shape, do.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -334,19 +334,19 @@ def chunk_dplr_bwd_o(
     dh: torch.Tensor,
     dv: torch.Tensor,
     w: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
     chunk_size: int = 64,
     scale: float = 1.0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 
     B, T, H, K, V = *w.shape, v.shape[-1]
 
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BK = min(triton.next_power_of_2(K), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
-    BV = min(triton.next_power_of_2(V), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
+    BK = min(max(triton.next_power_of_2(K), 16), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
+    BV = min(max(triton.next_power_of_2(V), 16), 64) if check_shared_mem() else min(triton.next_power_of_2(K), 32)
     NK = triton.cdiv(K, BK)
     dq = torch.empty_like(k)
     dk = torch.empty_like(k)
@@ -391,18 +391,18 @@ def chunk_dplr_bwd_dAu(
     do: torch.Tensor,
     A_qb: torch.Tensor,
     scale: float,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    chunk_size: int = 64
+    cu_seqlens: torch.LongTensor | None = None,
+    chunk_size: int = 64,
 ) -> torch.Tensor:
     B, T, H, V = v.shape
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
     if check_shared_mem('ampere'):  # A100
         BV = min(triton.next_power_of_2(V), 128)
     elif check_shared_mem('ada'):  # 4090
-        BV = min(triton.next_power_of_2(V), 64)
+        BV = min(max(triton.next_power_of_2(V), 16), 64)
     else:
         BV = min(triton.next_power_of_2(V), 32)
 

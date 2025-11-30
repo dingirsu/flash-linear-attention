@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 import pytest
 import torch
@@ -16,11 +15,11 @@ from .test_modeling_base import run_test_generation, run_test_model_forward_back
     [
         pytest.param(*test, id="L{}-B{}-T{}-H{}-D{}-use_l2warp{}-{}".format(*test))
         for test in [
-            (4, 4, 1024, 4, 64, True, torch.bfloat16),
-            (4, 4, 1024, 4, 64, False, torch.bfloat16),
-            (4, 4, 1024, 4, 128, False, torch.bfloat16),
+            (4, 4, 1024, 18, 64, True, torch.bfloat16),
+            (4, 4, 1024, 18, 64, False, torch.bfloat16),
+            (4, 4, 1024, 9, 128, False, torch.bfloat16),
         ]
-    ]
+    ],
 )
 def test_modeling(
     L: int,
@@ -42,9 +41,9 @@ def test_modeling(
     [
         pytest.param(*test, id="L{}-B{}-T{}-H{}-D{}-{}".format(*test))
         for test in [
-            (2, 4, 2000, 8, 64, torch.float16),
+            (2, 4, 2000, 18, 64, torch.float16),
         ]
-    ]
+    ],
 )
 def test_generation(
     L: int,

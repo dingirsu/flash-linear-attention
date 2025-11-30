@@ -1,17 +1,14 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
-from fla.utils import input_guard, is_amd
+from fla.utils import IS_AMD, autotune_cache_kwargs, input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
-NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if is_amd else [1, 2, 4, 8, 16, 32]
+NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
 @triton.autotune(
@@ -19,7 +16,8 @@ NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if is_amd else [1, 2, 4, 8, 16, 32]
         triton.Config({}, num_warps=num_warps)
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def l2norm_fwd_kernel1(
@@ -38,7 +36,7 @@ def l2norm_fwd_kernel1(
     mask = cols < D
 
     b_x = tl.load(x + cols, mask=mask, other=0.0).to(tl.float32)
-    b_rstd = 1 / (tl.sqrt(tl.sum(b_x * b_x) + eps))
+    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x) + eps)
     b_y = b_x * b_rstd
     tl.store(y + cols, b_y, mask=mask)
     tl.store(rstd + i_t, b_rstd)
@@ -49,7 +47,8 @@ def l2norm_fwd_kernel1(
         triton.Config({}, num_warps=num_warps)
         for num_warps in NUM_WARPS_AUTOTUNE
     ],
-    key=['D']
+    key=['D'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def l2norm_bwd_kernel1(
@@ -81,7 +80,8 @@ def l2norm_bwd_kernel1(
         for num_warps in [1, 2, 4, 8, 16]
         for BT in BT_LIST
     ],
-    key=['D', 'NB']
+    key=['D', 'NB'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def l2norm_fwd_kernel(
@@ -91,9 +91,9 @@ def l2norm_fwd_kernel(
     eps,
     T: tl.constexpr,
     D: tl.constexpr,
-    BT: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
+    BT: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
@@ -101,7 +101,7 @@ def l2norm_fwd_kernel(
     p_rstd = tl.make_block_ptr(rstd, (T,), (1,), (i_t * BT,), (BT,), (0,))
 
     b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
-    b_rstd = 1 / (tl.sqrt(tl.sum(b_x * b_x, 1) + eps))
+    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x, 1) + eps)
     b_y = b_x * b_rstd[:, None]
 
     tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
@@ -114,7 +114,8 @@ def l2norm_fwd_kernel(
         for num_warps in [1, 2, 4, 8, 16]
         for BT in BT_LIST
     ],
-    key=['D', 'NB']
+    key=['D', 'NB'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def l2norm_bwd_kernel(
@@ -125,9 +126,9 @@ def l2norm_bwd_kernel(
     eps,
     T: tl.constexpr,
     D: tl.constexpr,
-    BT: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
+    BT: tl.constexpr,
 ):
     i_t = tl.program_id(0)
     p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
@@ -145,7 +146,7 @@ def l2norm_bwd_kernel(
 def l2norm_fwd(
     x: torch.Tensor,
     eps: float = 1e-6,
-    output_dtype: Optional[torch.dtype] = None
+    output_dtype: torch.dtype | None = None,
 ):
     x_shape_og = x.shape
     x = x.view(-1, x.shape[-1])
@@ -192,7 +193,7 @@ def l2norm_bwd(
     y: torch.Tensor,
     rstd: torch.Tensor,
     dy: torch.Tensor,
-    eps: float = 1e-6
+    eps: float = 1e-6,
 ):
     y_shape_og = y.shape
     y = y.view(-1, dy.shape[-1])
@@ -243,7 +244,7 @@ class L2NormFunction(torch.autograd.Function):
         ctx,
         x,
         eps=1e-6,
-        output_dtype=None
+        output_dtype=None,
     ):
         y, rstd = l2norm_fwd(x, eps, output_dtype)
         ctx.eps = eps
@@ -262,7 +263,7 @@ class L2NormFunction(torch.autograd.Function):
 def l2norm(
     x: torch.Tensor,
     eps: float = 1e-6,
-    output_dtype: Optional[torch.dtype] = None
+    output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     return L2NormFunction.apply(x, eps, output_dtype)
 
@@ -275,7 +276,7 @@ class L2Norm(nn.Module):
     def __init__(
         self,
         eps: float = 1e-6,
-        output_dtype: Optional[torch.dtype] = None
+        output_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         self.eps = eps

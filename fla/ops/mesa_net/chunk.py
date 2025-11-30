@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 
@@ -26,8 +24,8 @@ def chunk_fwd_mesa_net_fwd(
     cu_seqlens: torch.Tensor,
     max_CG_iteration: int = 30,
     chunk_size: int = 64,
-    h_kk_init: Optional[torch.Tensor] = None,
-    h_kv_init: Optional[torch.Tensor] = None,
+    h_kk_init: torch.Tensor | None = None,
+    h_kv_init: torch.Tensor | None = None,
     output_final_state: bool = False,
 ) -> torch.Tensor:
 
@@ -42,7 +40,7 @@ def chunk_fwd_mesa_net_fwd(
         output_final_state=output_final_state,
         states_in_fp32=False,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     q_star, o = chunk_mesa_cg_fwd(
         q=q,
@@ -55,7 +53,7 @@ def chunk_fwd_mesa_net_fwd(
         lamb=lamb,
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
-        max_CG_iteration=max_CG_iteration
+        max_CG_iteration=max_CG_iteration,
     )
     return g, q_star, o, (h_kk_final, h_kv_final)
 
@@ -72,10 +70,10 @@ def chunk_fwd_mesa_net_bwd(
     cu_seqlens: torch.Tensor,
     max_CG_iteration: int = 30,
     chunk_size: int = 64,
-    h_kk_init: Optional[torch.Tensor] = None,
-    h_kv_init: Optional[torch.Tensor] = None,
-    dh_kv_final: Optional[torch.Tensor] = None,
-    dh_kk_final: Optional[torch.Tensor] = None,
+    h_kk_init: torch.Tensor | None = None,
+    h_kv_init: torch.Tensor | None = None,
+    dh_kv_final: torch.Tensor | None = None,
+    dh_kk_final: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # recompute the hidden states, which is quite cheap
     h_kk, h_kv, _, _ = chunk_mesa_fwd_h(
@@ -88,7 +86,7 @@ def chunk_fwd_mesa_net_bwd(
         output_final_state=False,
         states_in_fp32=False,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     dh_kv, dh0_kv = chunk_bwd_dh(
         q=q_star,
@@ -115,7 +113,7 @@ def chunk_fwd_mesa_net_bwd(
         g=g,
         do=do,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     dq = chunk_mesa_cg_bwd(
         dq=dq,
@@ -127,7 +125,7 @@ def chunk_fwd_mesa_net_bwd(
         cu_seqlens=cu_seqlens,
         chunk_size=chunk_size,
         max_CG_iteration=max_CG_iteration,
-        output_dtype=torch.float16
+        output_dtype=torch.float16,
     )
     dh_kk, dh0_kk = chunk_bwd_dh(
         q=dq,
@@ -154,7 +152,7 @@ def chunk_fwd_mesa_net_bwd(
         q_star=q_star,
         dq=dq,
         cu_seqlens=cu_seqlens,
-        chunk_size=chunk_size
+        chunk_size=chunk_size,
     )
     dg.add_(dg2)
     dg = chunk_local_cumsum(dg, chunk_size=chunk_size, reverse=True, cu_seqlens=cu_seqlens).to(g)
@@ -165,54 +163,69 @@ class ChunkMesaNetFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, g, beta, lamb,
-                cu_seqlens, max_CG_iteration,
-                h_kk_init, h_kv_init, output_final_state, use_qk_l2norm_in_kernel):
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        lamb,
+        cu_seqlens,
+        max_CG_iteration,
+        h_kk_init,
+        h_kv_init,
+        output_final_state,
+        use_qk_l2norm_in_kernel,
+    ):
         chunk_size = 64
-        q_orig = q
-        k_orig = k
 
         if use_qk_l2norm_in_kernel:
-            q = l2norm_fwd(q, output_dtype=torch.float16)
-            k = l2norm_fwd(k, output_dtype=torch.float16)
+            q, q_rstd = l2norm_fwd(q, output_dtype=torch.float16)
+            k, k_rstd = l2norm_fwd(k, output_dtype=torch.float16)
         else:
+            q_rstd, k_rstd = None, None
             q = q.to(torch.float16)
             k = k.to(torch.float16)
-        g_cumsum, q_star, o, (h_kk_final, h_kv_final) = chunk_fwd_mesa_net_fwd(q, k, v, g, beta, lamb,
-                                                                               cu_seqlens, max_CG_iteration, chunk_size,
-                                                                               h_kk_init, h_kv_init, output_final_state)
+
+        g_cumsum, q_star, o, (h_kk_final, h_kv_final) = chunk_fwd_mesa_net_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            lamb=lamb,
+            cu_seqlens=cu_seqlens,
+            max_CG_iteration=max_CG_iteration,
+            chunk_size=chunk_size,
+            h_kk_init=h_kk_init,
+            h_kv_init=h_kv_init,
+            output_final_state=output_final_state,
+        )
         ctx.max_CG_iteration = max_CG_iteration
         ctx.chunk_size = chunk_size
         ctx.cu_seqlens = cu_seqlens
         ctx.use_qk_l2norm_in_kernel = use_qk_l2norm_in_kernel
-        ctx.save_for_backward(q_orig, k_orig, v, g_cumsum, beta, lamb, h_kk_init, h_kv_init, q_star, o)
+        ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g_cumsum, beta, lamb, h_kk_init, h_kv_init, q_star, o)
         return o, h_kk_final, h_kv_final
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do, dh_kk_final=None, dh_kv_final=None):
-        q, k, v, g, beta, lamb, h_kk_init, h_kv_init, q_star, o = ctx.saved_tensors
-        if ctx.use_qk_l2norm_in_kernel:
-            q, q_orig = l2norm_fwd(q, output_dtype=torch.float16), q
-            k, k_orig = l2norm_fwd(k, output_dtype=torch.float16), k
-        else:
-            q = q.to(torch.float16)
-            k = k.to(torch.float16)
+        q, q_rstd, k, k_rstd, v, g, beta, lamb, h_kk_init, h_kv_init, q_star, o = ctx.saved_tensors
+
         max_CG_iteration = ctx.max_CG_iteration
         chunk_size = ctx.chunk_size
         cu_seqlens = ctx.cu_seqlens
         dq, dk, dv, dg, dbeta, dlamb, dh0_kk, dh0_kv = chunk_fwd_mesa_net_bwd(
             q=q, k=k, v=v, g=g, beta=beta, lamb=lamb, q_star=q_star, do=do,
             cu_seqlens=cu_seqlens, max_CG_iteration=max_CG_iteration, chunk_size=chunk_size,
-            h_kk_init=h_kk_init, h_kv_init=h_kv_init, dh_kv_final=dh_kv_final, dh_kk_final=dh_kk_final
+            h_kk_init=h_kk_init, h_kv_init=h_kv_init, dh_kv_final=dh_kv_final, dh_kk_final=dh_kk_final,
         )
         if ctx.use_qk_l2norm_in_kernel:
-            dq = l2norm_bwd(q_orig, dq).to(q_orig)
-            dk = l2norm_bwd(k_orig, dk).to(k_orig)
-        else:
-            dq = dq.to(q)
-            dk = dk.to(k)
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
         return dq, dk, dv.to(v), dg.to(g), dbeta.to(beta), dlamb.to(lamb), None, None, dh0_kk, dh0_kv, None, None
 
 
@@ -224,12 +237,12 @@ def chunk_mesa_net(
     g: torch.Tensor,
     beta: torch.Tensor,
     lamb: torch.Tensor,
-    h_kk_init: Optional[torch.Tensor] = None,
-    h_kv_init: Optional[torch.Tensor] = None,
+    h_kk_init: torch.Tensor | None = None,
+    h_kv_init: torch.Tensor | None = None,
     output_final_state: bool = False,
     max_CG_iteration: int = 30,
     use_qk_l2norm_in_kernel: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     r"""
     Args:
@@ -327,17 +340,17 @@ def chunk_mesa_net(
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
+                f"Please flatten variable-length inputs before processing.",
             )
         if h_kk_init is not None and h_kk_init.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {h_kk_init.shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {h_kk_init.shape[0]}.",
             )
         if h_kv_init is not None and h_kv_init.shape[0] != len(cu_seqlens) - 1:
             raise ValueError(
                 f"The number of initial states is expected to be equal to the number of input sequences, "
-                f"i.e., {len(cu_seqlens) - 1} rather than {h_kv_init.shape[0]}."
+                f"i.e., {len(cu_seqlens) - 1} rather than {h_kv_init.shape[0]}.",
             )
     o, final_state_kk, final_state_kv = ChunkMesaNetFunction.apply(
         q,
@@ -351,6 +364,6 @@ def chunk_mesa_net(
         h_kk_init,
         h_kv_init,
         output_final_state,
-        use_qk_l2norm_in_kernel
+        use_qk_l2norm_in_kernel,
     )
     return o, final_state_kk, final_state_kv

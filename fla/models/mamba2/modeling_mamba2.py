@@ -14,18 +14,16 @@
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
-from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput, logging
 from transformers.utils.deprecation import deprecate_kwarg
 
 from fla.layers.mamba2 import Mamba2
 from fla.models.mamba2.configuration_mamba2 import Mamba2Config
+from fla.models.utils import FLAGenerationMixin
 from fla.modules import FusedCrossEntropyLoss, FusedLinearCrossEntropyLoss, RMSNorm
 from fla.modules.l2warp import l2_warp
 
@@ -33,6 +31,12 @@ try:
     from torch.distributed.tensor import DTensor
 except (ImportError, AttributeError):
     DTensor = None
+
+try:
+    from transformers.modeling_layers import GradientCheckpointingLayer
+except ImportError:
+    from fla.models.modeling_layers import GradientCheckpointingLayer
+
 
 logger = logging.get_logger(__name__)
 
@@ -72,7 +76,7 @@ class Mamba2Cache:
         config: Mamba2Config,
         batch_size: int,
         dtype: torch.dtype = torch.float16,
-        device: Optional[str] = None,
+        device: str | None = None,
     ):
         self.dtype = dtype
         self.conv_kernel_size = config.conv_kernel
@@ -104,7 +108,7 @@ class Mamba2Cache:
         self,
         layer_idx: int,
         new_conv_state: torch.Tensor,
-        cache_init: bool = False
+        cache_init: bool = False,
     ) -> torch.Tensor:
         if cache_init:
             self.conv_states[layer_idx] = new_conv_state.to(self.conv_states.device)
@@ -122,7 +126,8 @@ class Mamba2Cache:
         self.ssm_states.zero_()
 
 
-class Mamba2Block(nn.Module):
+class Mamba2Block(GradientCheckpointingLayer):
+
     def __init__(self, config, layer_idx):
         super().__init__()
         self.config = config
@@ -153,9 +158,9 @@ class Mamba2Block(nn.Module):
     def forward(
         self,
         hidden_states,
-        cache_params: Optional[Mamba2Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        cache_params: Mamba2Cache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
     ):
         residual = hidden_states
         hidden_states = self.norm(hidden_states)
@@ -174,7 +179,7 @@ class Mamba2Block(nn.Module):
         return hidden_states
 
 
-class Mamba2PreTrainedModel(PreTrainedModel, GenerationMixin):
+class Mamba2PreTrainedModel(PreTrainedModel):
     """
     An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
     models.
@@ -211,7 +216,7 @@ class Mamba2PreTrainedModel(PreTrainedModel, GenerationMixin):
             dt = torch.exp(
                 torch.rand(self.config.num_heads)
                 * (math.log(self.config.time_step_max) - math.log(self.config.time_step_min))
-                + math.log(self.config.time_step_min)
+                + math.log(self.config.time_step_min),
             ).clamp(min=self.config.time_step_floor)
 
             # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
@@ -285,9 +290,9 @@ class Mamba2Output(ModelOutput):
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    last_hidden_state: Optional[torch.FloatTensor] = None
-    cache_params: Optional[Mamba2Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    last_hidden_state: torch.FloatTensor | None = None
+    cache_params: Mamba2Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 @dataclass
@@ -314,10 +319,10 @@ class Mamba2CausalLMOutput(ModelOutput):
             Hidden-states of the model at the output of each layer plus the optional initial embedding outputs.
     """
 
-    loss: Optional[torch.FloatTensor] = None
-    logits: Optional[torch.FloatTensor] = None
-    cache_params: Optional[Mamba2Cache] = None
-    hidden_states: Optional[Tuple[torch.FloatTensor]] = None
+    loss: torch.FloatTensor | None = None
+    logits: torch.FloatTensor | None = None
+    cache_params: Mamba2Cache | None = None
+    hidden_states: tuple[torch.FloatTensor] | None = None
 
 
 class Mamba2Model(Mamba2PreTrainedModel):
@@ -347,16 +352,16 @@ class Mamba2Model(Mamba2PreTrainedModel):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.LongTensor] = None,
-        cache_params: Optional[Mamba2Cache] = None,
-        use_cache: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.LongTensor | None = None,
+        cache_params: Mamba2Cache | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.Tensor | None = None,
         **kwargs,
-    ) -> Union[Tuple, Mamba2Output]:
+    ) -> tuple | Mamba2Output:
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
@@ -369,13 +374,10 @@ class Mamba2Model(Mamba2PreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds = self.embeddings(input_ids)
 
-        if self.gradient_checkpointing and self.training and use_cache:
-            use_cache = False
-
         if use_cache:
             if cache_params is None:
                 cache_params = Mamba2Cache(
-                    self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype
+                    self.config, inputs_embeds.size(0), device=inputs_embeds.device, dtype=inputs_embeds.dtype,
                 )
                 cache_position = torch.arange(0, self.config.conv_kernel, device=inputs_embeds.device)
             elif cache_position is None:
@@ -385,7 +387,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
                 raise ValueError(
                     "You have to specify the `cache_position` manually when `use_cache=True` and `cache_params` is passed, "
                     "you don't have to pass a `cache_params` if you are in prefilling stage because in that case it will "
-                    "be initialized for you automatically"
+                    "be initialized for you automatically",
                 )
         else:
             cache_params = None
@@ -393,21 +395,12 @@ class Mamba2Model(Mamba2PreTrainedModel):
         hidden_states = inputs_embeds
         all_hidden_states = () if output_hidden_states else None
         for mixer_block in self.layers:
-            if self.gradient_checkpointing and self.training:
-                hidden_states = self._gradient_checkpointing_func(
-                    mixer_block.__call__,
-                    hidden_states,
-                    cache_params,
-                    cache_position,
-                    attention_mask,
-                )
-            else:
-                hidden_states = mixer_block(
-                    hidden_states,
-                    cache_params=cache_params,
-                    cache_position=cache_position,
-                    attention_mask=attention_mask,
-                )
+            hidden_states = mixer_block(
+                hidden_states,
+                cache_params=cache_params,
+                cache_position=cache_position,
+                attention_mask=attention_mask,
+            )
 
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
@@ -427,7 +420,7 @@ class Mamba2Model(Mamba2PreTrainedModel):
         )
 
 
-class Mamba2ForCausalLM(Mamba2PreTrainedModel):
+class Mamba2ForCausalLM(Mamba2PreTrainedModel, FLAGenerationMixin):
     _tied_weights_keys = []
 
     def __init__(self, config):
@@ -452,69 +445,20 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
         return self.backbone.set_input_embeddings(new_embeddings)
 
     @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
-    def prepare_inputs_for_generation(
-        self,
-        input_ids,
-        inputs_embeds=None,
-        use_cache=None,
-        cache_params: Optional[Mamba2Cache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        logits_to_keep: Optional[int] = None,
-        **kwargs,
-    ):
-        if use_cache:
-            # `cache_position` should have been initialized in `generate`
-            if cache_position is None:
-                raise ValueError(
-                    "`cache_position` should not be None as it should have been initialized in "
-                    "`model.generate`, you are responsible for passing in a valid `cache_position` if "
-                    "you are calling `prepare_inputs_for_generation` directly with `use_cache=True`"
-                )
-            if cache_position[0] > 0:
-                input_ids = input_ids[:, -1][..., None]
-
-                if attention_mask is not None:
-                    attention_mask = None
-            else:
-                # we initialize the `cache_position` to full size of `conv_states` at prefill stage
-                # considering padding will be applied when input length is shorter, and truncation
-                # will be applied when it is longer, so it will be equivalent to always have it match
-                # the length of `cache_params.conv_states`, which is `config.conv_kernel`
-                cache_position = torch.arange(0, self.config.conv_kernel, device=input_ids.device)
-
-        if inputs_embeds is not None and cache_params is None:
-            model_inputs = {"inputs_embeds": inputs_embeds}
-        else:
-            model_inputs = {"input_ids": input_ids}
-
-        if logits_to_keep is not None:
-            model_inputs['logits_to_keep'] = logits_to_keep
-
-        model_inputs.update({
-            'attention_mask': attention_mask,
-            'cache_params': cache_params,
-            'use_cache': use_cache,
-            'cache_position': cache_position,
-            'logits_to_keep': logits_to_keep
-        })
-        return model_inputs
-
-    @deprecate_kwarg("num_logits_to_keep", version="4.50", new_name="logits_to_keep")
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        cache_params: Optional[Mamba2Cache] = None,
-        labels: Optional[torch.LongTensor] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        use_cache: Optional[bool] = None,
-        cache_position: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        logits_to_keep: Optional[int] = 0,
+        input_ids: torch.LongTensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_params: Mamba2Cache | None = None,
+        labels: torch.LongTensor | None = None,
+        output_hidden_states: bool | None = None,
+        return_dict: bool | None = None,
+        use_cache: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        logits_to_keep: int | None = 0,
         **kwargs,  # for now we need this for generation
-    ) -> Union[Tuple, Mamba2CausalLMOutput]:
+    ) -> tuple | Mamba2CausalLMOutput:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for language modeling. Note that the labels **are shifted** inside the model, i.e. you can set
@@ -534,14 +478,13 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
             attention_mask=attention_mask,
         )
         hidden_states = outputs[0]
-        fuse_linear_and_cross_entropy = self.config.fuse_cross_entropy and self.training and labels is not None
 
         loss, logits = None, None
-        if not fuse_linear_and_cross_entropy or labels is None:
+        if not self.config.fuse_linear_cross_entropy or labels is None:
             logits = self.lm_head(hidden_states if logits_to_keep is None else hidden_states[:, -logits_to_keep:])
         if labels is not None:
             if getattr(self, 'criterion', None) is None:
-                if fuse_linear_and_cross_entropy:
+                if self.config.fuse_linear_cross_entropy:
                     criterion = FusedLinearCrossEntropyLoss(use_l2warp=self.config.use_l2warp)
                 elif self.config.fuse_cross_entropy:
                     criterion = FusedCrossEntropyLoss(inplace_backward=True)
@@ -551,7 +494,7 @@ class Mamba2ForCausalLM(Mamba2PreTrainedModel):
                 criterion = self.criterion
             labels = labels.to(hidden_states.device)
             labels = torch.cat((labels[..., 1:], torch.full_like(labels[:, :1], criterion.ignore_index)), 1)
-            if fuse_linear_and_cross_entropy:
+            if self.config.fuse_linear_cross_entropy:
                 loss = criterion(hidden_states, labels, self.lm_head.weight, self.lm_head.bias)
             else:
                 loss = criterion(logits.view(labels.numel(), -1), labels.view(-1))

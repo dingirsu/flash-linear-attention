@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 import triton
@@ -291,13 +289,13 @@ def parallel_based_bwd_kernel(
     _parallel_based_bwd_dq(
         i_bh, i_c, i_k, i_v,
         q, k, v, do, dz, dq,
-        scale, T, B, H, BTL, BTS, BK, BV, K, V
+        scale, T, B, H, BTL, BTS, BK, BV, K, V,
     )
     tl.debug_barrier()
     _parallel_based_bwd_dkv(
         i_bh, i_c, i_k, i_v,
         q, k, v, do, dz, dk, dv,
-        scale, T, B, H, BTL, BTS, BK, BV, K, V
+        scale, T, B, H, BTL, BTS, BK, BV, K, V,
     )
 
 
@@ -310,9 +308,8 @@ class ParallelBasedFunction(torch.autograd.Function):
         BTL, BTS = 128, 32
         assert BTL % BTS == 0
         # assert q.shape[-1] % 16 == 0
-        BK = min(128, triton.next_power_of_2(k.shape[-1]))
-        BV = min(128, triton.next_power_of_2(v.shape[-1]))
-        BK, BV = max(BK, 16), max(BV, 16)
+        BK = min(128, max(triton.next_power_of_2(k.shape[-1]), 16))
+        BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
         B, H, T, K, V = *k.shape, v.shape[-1]
         num_stages = 2
         num_warps = 4
@@ -337,7 +334,7 @@ class ParallelBasedFunction(torch.autograd.Function):
             BK=BK,
             BV=BV,
             num_warps=num_warps,
-            num_stages=num_stages
+            num_stages=num_stages,
         )
         ctx.save_for_backward(q, k, v)
         ctx.scale = scale
@@ -351,9 +348,8 @@ class ParallelBasedFunction(torch.autograd.Function):
         scale = ctx.scale
         BTL, BTS = 64, 32
         assert BTL % BTS == 0
-        BK = min(128, triton.next_power_of_2(k.shape[-1]))
-        BV = min(128, triton.next_power_of_2(v.shape[-1]))
-        BK, BV = max(BK, 16), max(BV, 16)
+        BK = min(128, max(triton.next_power_of_2(k.shape[-1]), 16))
+        BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
         B, H, T, K, V = *k.shape, v.shape[-1]
         num_stages = 2
         num_warps = 4
@@ -380,7 +376,7 @@ class ParallelBasedFunction(torch.autograd.Function):
             BK=BK,
             BV=BV,
             num_warps=num_warps,
-            num_stages=num_stages
+            num_stages=num_stages,
         )
 
         return dq.sum(0).to(q.dtype), dk.sum(0).to(k.dtype), dv.sum(0).to(v.dtype), None
@@ -393,9 +389,9 @@ def parallel_based(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    scale: Optional[float] = None,
+    scale: float | None = None,
     use_norm: bool = True,
-    head_first: bool = False
+    head_first: bool = False,
 ):
     assert q.shape[-1] <= 128, "only support feature dim up to 128"
     if scale is None:

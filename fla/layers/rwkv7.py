@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -18,6 +17,7 @@ from fla.modules.token_shift import token_shift
 from fla.ops.rwkv7 import chunk_rwkv7, fused_mul_recurrent_rwkv7
 from fla.ops.rwkv7.fused_addcmul import fused_addcmul_rwkv7
 from fla.ops.rwkv7.fused_k_update import fused_k_rwkv7
+from fla.ops.rwkv7.gate_output_correction import gate_output_correction
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -29,19 +29,19 @@ class RWKV7Attention(nn.Module):
         self,
         mode: str = 'chunk',
         hidden_size: int = 1024,
-        head_dim: Optional[int] = 64,
-        num_heads: Optional[int] = None,
-        decay_low_rank_dim: Optional[int] = None,
-        gate_low_rank_dim: Optional[int] = None,
-        a_low_rank_dim: Optional[int] = None,
-        v_low_rank_dim: Optional[int] = None,
-        elementwise_affine: Optional[bool] = True,
+        head_dim: int | None = 64,
+        num_heads: int | None = None,
+        decay_low_rank_dim: int | None = None,
+        gate_low_rank_dim: int | None = None,
+        a_low_rank_dim: int | None = None,
+        v_low_rank_dim: int | None = None,
+        elementwise_affine: bool | None = True,
         norm_eps: float = 1e-5,
         layer_idx: int = None,
         fuse_norm: bool = False,
         value_dim: int = None,
         num_hidden_layers: int = None,
-        **kwargs
+        **kwargs,
     ) -> RWKV7Attention:
         super().__init__()
 
@@ -61,26 +61,28 @@ class RWKV7Attention(nn.Module):
             self.num_heads = num_heads
         self.head_v_dim = int(self.value_dim // self.num_heads)
 
+        # Increase lora dimension for headdim>64
+        factor = self.head_dim / 64
         if decay_low_rank_dim is None:
-            decay_low_rank_dim = max(32, int(round((1.8 * (hidden_size**0.5)) / 32) * 32))
+            decay_low_rank_dim = max(32, int(round((2.5 * (hidden_size**0.5)) * factor / 32) * 32))
             self.decay_low_rank_dim = decay_low_rank_dim
         else:
             self.decay_low_rank_dim = decay_low_rank_dim
 
         if gate_low_rank_dim is None:
-            gate_low_rank_dim = max(32, int(round((0.6 * (hidden_size**0.8)) / 32) * 32))
+            gate_low_rank_dim = max(32, int(round((5 * (hidden_size**0.5)) / 32) * 32))
             self.gate_low_rank_dim = gate_low_rank_dim
         else:
             self.gate_low_rank_dim = gate_low_rank_dim
 
         if a_low_rank_dim is None:
-            a_low_rank_dim = max(32, int(round((1.8 * (hidden_size**0.5)) / 32) * 32))
+            a_low_rank_dim = max(32, int(round((2.5 * (hidden_size**0.5)) * factor / 32) * 32))
             self.a_low_rank_dim = a_low_rank_dim
         else:
             self.a_low_rank_dim = a_low_rank_dim
 
         if v_low_rank_dim is None:
-            v_low_rank_dim = max(32, int(round((1.3 * (hidden_size**0.5)) / 32) * 32))
+            v_low_rank_dim = max(32, int(round((1.7 * (hidden_size**0.5)) * factor / 32) * 32))
             self.v_low_rank_dim = v_low_rank_dim
         else:
             self.v_low_rank_dim = v_low_rank_dim
@@ -125,7 +127,7 @@ class RWKV7Attention(nn.Module):
                 num_groups=self.num_heads,
                 num_channels=self.value_dim,
                 eps=self.head_dim*norm_eps,
-                affine=elementwise_affine
+                affine=elementwise_affine,
             )
 
         try:
@@ -141,7 +143,7 @@ class RWKV7Attention(nn.Module):
             "According to Bo, you are using a potentially buggy FLA implementation of RWKV. "
             "If you plan to report any numbers based on this implementation, we strongly recommend "
             "cross-checking with the official repo: https://github.com/BlinkDL/RWKV-LM. "
-            "Bo may disagree with results reported from this version."
+            "Bo may disagree with results reported from this version.",
         )
 
     @torch.no_grad()
@@ -194,9 +196,9 @@ class RWKV7Attention(nn.Module):
             self.g_norm.weight.data[:] = ((self.layer_idx + 1) / self.num_hidden_layers) ** 0.7
 
             # Initialize Linear projections
-            nn.init.orthogonal_(self.r_proj.weight)
-            nn.init.orthogonal_(self.k_proj.weight, gain=0.1)
-            nn.init.orthogonal_(self.v_proj.weight)
+            self._orthogonal_init(self.r_proj.weight)
+            self._orthogonal_init(self.k_proj.weight, gain=0.1)
+            self._orthogonal_init(self.v_proj.weight)
             self.o_proj.weight.data.zero_()
 
             # Clean up temporary tensors to free memory
@@ -204,47 +206,52 @@ class RWKV7Attention(nn.Module):
 
         module._is_hf_initialized = True
 
+    @staticmethod
+    def _orthogonal_init(weight, gain=1.0):
+        oringinal_dtype = weight.dtype
+        weight = weight.float()
+        nn.init.orthogonal_(weight, gain=gain)
+        weight = weight.to(oringinal_dtype)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
         v_first: torch.Tensor = None,
-        cu_seqlens: Optional[torch.LongTensor] = None,
-        **kwargs
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        cu_seqlens: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
+        batch_size, seq_len, _ = hidden_states.shape
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
                 "for padding purposes (0 indicating padding). "
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
-
-        batch_size, seq_len, _ = hidden_states.shape
+            am = attention_mask.narrow(1, attention_mask.size(1) - seq_len, seq_len).unsqueeze(-1)
 
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
         if attention_mask is not None:
-            hidden_states = hidden_states.mul(attention_mask[:, -seq_len:, None])
+            hidden_states = hidden_states.mul(am)
 
         # delta [batch_size, seq_len, hidden_size]
+        # conv_cache [N, D]
         if last_state is None:
-            delta = token_shift(hidden_states, cu_seqlens)
+            conv_cache = None
             recurrent_state = None
-        elif hidden_states.shape[1] == 1:
-            shifted = last_state['conv_state'].unsqueeze(1)
-            delta = shifted - hidden_states
-            recurrent_state = last_state['recurrent_state']
         else:
-            shifted = self.time_shift(hidden_states)
-            shifted[:, 0] = last_state['conv_state']
-            delta = shifted - hidden_states
+            conv_cache = last_state['conv_state']
             recurrent_state = last_state['recurrent_state']
 
+        delta, conv_state = token_shift(
+                hidden_states, cu_seqlens, output_cache=True, cache=conv_cache,
+            )
         xr, xw, xk, xv, xa, xg = fused_addcmul_rwkv7(hidden_states, delta, self.x_r, self.x_w,
                                                      self.x_k, self.x_v, self.x_a, self.x_g)
 
@@ -286,7 +293,7 @@ class RWKV7Attention(nn.Module):
 
         # dealing with left-padding
         if attention_mask is not None:
-            v = v * attention_mask[:, -seq_len:, None]
+            v = v * am
 
         r, w, k, a = map(lambda x: rearrange(x, 'b t (h d) -> b t h d', d=self.head_dim), (r, w, k, a))
         v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_v_dim)
@@ -323,9 +330,9 @@ class RWKV7Attention(nn.Module):
         if past_key_values is not None:
             past_key_values.update(
                 recurrent_state=recurrent_state,
-                conv_state=hidden_states[:, -1],
+                conv_state=conv_state,
                 layer_idx=self.layer_idx,
-                offset=r.shape[1]
+                offset=r.shape[1],
             )
 
         if self.fuse_norm:
@@ -333,7 +340,7 @@ class RWKV7Attention(nn.Module):
         else:
             o = self.g_norm(rearrange(o, 'b t h d -> (b t) (h d)')).view(batch_size, seq_len, -1)
 
-        o = o + ((r * k * self.r_k).sum(-1, keepdim=True) * v).view(batch_size, seq_len, -1)
-        o = self.o_proj(o * g)
+        o = gate_output_correction(o, r, k, self.r_k, v, g)
+        o = self.o_proj(o)
 
         return o, None, past_key_values, v_first

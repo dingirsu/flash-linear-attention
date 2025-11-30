@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -10,13 +7,13 @@ import triton.language as tl
 from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.solve_tril import solve_tril
-from fla.utils import check_shared_mem, is_nvidia_hopper
+from fla.utils import IS_NVIDIA_HOPPER, autotune_cache_kwargs, check_shared_mem
 
-NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
+NUM_WARPS = [2, 4] if IS_NVIDIA_HOPPER else [2, 4, 8]
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -25,6 +22,7 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def recompute_w_u_fwd_kernel(
@@ -43,7 +41,7 @@ def recompute_w_u_fwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -77,7 +75,7 @@ def recompute_w_u_fwd_kernel(
 
 
 @triton.heuristics({
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -86,6 +84,7 @@ def recompute_w_u_fwd_kernel(
         for num_stages in [2, 3, 4]
     ],
     key=['H', 'K', 'V', 'BT', 'BK', 'BV', 'IS_VARLEN'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def prepare_wy_repr_bwd_kernel(
@@ -107,7 +106,7 @@ def prepare_wy_repr_bwd_kernel(
     BT: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -181,12 +180,11 @@ def prepare_wy_repr_fwd(
     k: torch.Tensor,
     v: torch.Tensor,
     beta: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     A = chunk_scaled_dot_kkt_fwd(
         k=k,
         beta=beta,
-        g_cumsum=None,
         cu_seqlens=cu_seqlens,
         chunk_size=64,
         output_dtype=torch.float32,
@@ -194,7 +192,7 @@ def prepare_wy_repr_fwd(
     A = solve_tril(
         A=A,
         cu_seqlens=cu_seqlens,
-        output_dtype=k.dtype
+        output_dtype=k.dtype,
     )
     w, u = recompute_w_u_fwd(
         k=k,
@@ -211,13 +209,13 @@ def recompute_w_u_fwd(
     v: torch.Tensor,
     beta: torch.Tensor,
     A: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor],
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = 64
     CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(V), CONST_TILING)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -251,13 +249,13 @@ def prepare_wy_repr_bwd(
     A: torch.Tensor,
     dw: torch.Tensor,
     du: torch.Tensor,
-    cu_seqlens: Optional[torch.LongTensor]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT = A.shape[-1]
     CONST_TILING = 64 if check_shared_mem() else 32
-    BK = min(triton.next_power_of_2(K), CONST_TILING)
-    BV = min(triton.next_power_of_2(V), CONST_TILING)
+    BK = min(max(triton.next_power_of_2(K), 16), CONST_TILING)
+    BV = min(max(triton.next_power_of_2(V), 16), CONST_TILING)
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)

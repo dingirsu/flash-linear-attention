@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import warnings
-from typing import Optional
 
 import torch
 import triton
@@ -19,14 +17,6 @@ from fla.utils import autocast_custom_bwd, autocast_custom_fwd, check_shared_mem
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4] + ([8] if check_shared_mem('hopper') else [])
-        for num_stages in [2, 3, 4, 5]
-    ],
-    key=['B', 'H', 'HQ', 'G', 'K', 'V', 'BK', 'BV', 'USE_G', 'IS_VARLEN'],
-)
 @triton.jit
 def parallel_attn_fwd_kernel(
     q,
@@ -157,7 +147,7 @@ def parallel_attn_bwd_kernel_preprocess(
     do,
     delta,
     B: tl.constexpr,
-    V: tl.constexpr
+    V: tl.constexpr,
 ):
     i_n = tl.program_id(0)
     o_d = tl.arange(0, B)
@@ -174,14 +164,6 @@ def parallel_attn_bwd_kernel_preprocess(
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4] + ([8] if check_shared_mem('hopper') else [])
-        for num_stages in [2, 3, 4, 5]
-    ],
-    key=['B', 'H', 'HQ', 'G', 'K', 'V', 'BK', 'BV', 'USE_G', 'IS_VARLEN'],
-)
 @triton.jit(do_not_specialize=['T'])
 def parallel_attn_bwd_kernel_dq(
     q,
@@ -208,7 +190,7 @@ def parallel_attn_bwd_kernel_dq(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -241,7 +223,7 @@ def parallel_attn_bwd_kernel_dq(
     # [BT, BK]
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     if USE_G:
-        b_dg = tl.zeros([BT, ], dtype=tl.float32)
+        b_dg = tl.zeros([BT ], dtype=tl.float32)
         p_gq = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
         b_gq = tl.load(p_gq, boundary_check=(0,)).to(tl.float32)
     else:
@@ -316,14 +298,6 @@ def parallel_attn_bwd_kernel_dq(
     'USE_G': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4] + ([8] if check_shared_mem('hopper') else [])
-        for num_stages in [2, 3, 4, 5]
-    ],
-    key=['B', 'H', 'HQ', 'G', 'K', 'V', 'BK', 'BV', 'USE_G', 'IS_VARLEN'],
-)
 @triton.jit(do_not_specialize=['T'])
 def parallel_attn_bwd_kernel_dkv(
     q,
@@ -351,7 +325,7 @@ def parallel_attn_bwd_kernel_dkv(
     BK: tl.constexpr,
     BV: tl.constexpr,
     USE_G: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -383,7 +357,7 @@ def parallel_attn_bwd_kernel_dkv(
     if USE_G:
         p_gk = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (i_t * BT,), (BT,), (0,))
         b_gk = tl.load(p_gk, boundary_check=(0,)).to(tl.float32)
-        b_dg = tl.zeros([BT,], dtype=tl.float32)
+        b_dg = tl.zeros([BT], dtype=tl.float32)
     else:
         b_gk = None
         b_dg = None
@@ -470,25 +444,27 @@ def parallel_attn_fwd(
     v: torch.Tensor,
     g_cumsum: torch.Tensor,
     scale: float,
-    chunk_size: int = 128,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
     G = HQ // H
-    BT = chunk_size
+    BT = 128
     if check_shared_mem('hopper', q.device.index):
         BS = min(64, max(16, triton.next_power_of_2(T)))
         BK = min(256, max(16, triton.next_power_of_2(K)))
         BV = min(256, max(16, triton.next_power_of_2(V)))
+        num_warps = 8
     elif check_shared_mem('ampere', q.device.index):
         BS = min(32, max(16, triton.next_power_of_2(T)))
         BK = min(256, max(16, triton.next_power_of_2(K)))
         BV = min(128, max(16, triton.next_power_of_2(V)))
+        num_warps = 4
     else:
         BS = min(32, max(16, triton.next_power_of_2(T)))
         BK = min(256, max(16, triton.next_power_of_2(K)))
         BV = min(64, max(16, triton.next_power_of_2(V)))
+        num_warps = 2
     NK = triton.cdiv(K, BK)
     NV = triton.cdiv(V, BV)
 
@@ -520,13 +496,14 @@ def parallel_attn_fwd(
         BS=BS,
         BK=BK,
         BV=BV,
+        num_warps=num_warps,
     )
     return o, lse
 
 
 def parallel_attn_bwd_preprocess(
     o: torch.Tensor,
-    do: torch.Tensor
+    do: torch.Tensor,
 ):
     V = o.shape[-1]
     delta = torch.empty_like(o[..., 0], dtype=torch.float)
@@ -550,16 +527,29 @@ def parallel_attn_bwd(
     do: torch.Tensor,
     scale: float = None,
     chunk_size: int = 128,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
     G = HQ // H
-    BT = chunk_size
-    BS = max(16, triton.next_power_of_2(T))
-    BS = min(32, BS) if check_shared_mem('ampere') else min(16, BS)  # SY:H100 should at least use BS=64 to use WGMMA
-    BK = max(16, triton.next_power_of_2(K))
-    BV = max(16, triton.next_power_of_2(V))
+    if check_shared_mem('hopper'):
+        BT = 128
+        BS = 64
+        BK = max(triton.next_power_of_2(K), 16)
+        BV = max(triton.next_power_of_2(V), 16)
+        num_warps = 8
+    elif check_shared_mem('ampere'):
+        BS = 32
+        BK = max(triton.next_power_of_2(K), 16)
+        BV = max(triton.next_power_of_2(V), 16)
+        BT = 128 if K <= 64 else 64
+        num_warps = 4
+    else:
+        BT = 64
+        BS = 32
+        BK = max(triton.next_power_of_2(K), 16)
+        BV = min(max(triton.next_power_of_2(V), 16), 64)
+        num_warps = 2
 
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
@@ -600,7 +590,8 @@ def parallel_attn_bwd(
         BT=BT,
         BS=BS,
         BK=BK,
-        BV=BV
+        BV=BV,
+        num_warps=num_warps,
     )
     parallel_attn_bwd_kernel_dkv[grid](
         q=q,
@@ -626,7 +617,8 @@ def parallel_attn_bwd(
         BT=BT,
         BS=BS,
         BK=BK,
-        BV=BV
+        BV=BV,
+        num_warps=num_warps,
     )
     dk = reduce(dk, 'b t (h g) k -> b t h k', g=G, reduction='sum')
     dv = reduce(dv, 'b t (h g) v -> b t h v', g=G, reduction='sum')
@@ -645,7 +637,6 @@ class ParallelAttentionFunction(torch.autograd.Function):
         ctx.dtype = q.dtype
 
         RCP_LN2: float = 1.4426950216
-        chunk_size = min(128, max(16, triton.next_power_of_2(q.shape[1])))
         g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, scale=RCP_LN2) if g is not None else None
         o, lse = parallel_attn_fwd(
             q=q,
@@ -653,11 +644,9 @@ class ParallelAttentionFunction(torch.autograd.Function):
             v=v,
             g_cumsum=g_cumsum,
             scale=scale,
-            chunk_size=chunk_size,
             cu_seqlens=cu_seqlens,
         )
         ctx.save_for_backward(q, k, v, o, g_cumsum, lse)
-        ctx.chunk_size = chunk_size
         ctx.cu_seqlens = cu_seqlens
         ctx.scale = scale
         return o.to(q.dtype)
@@ -676,7 +665,6 @@ class ParallelAttentionFunction(torch.autograd.Function):
             lse=lse,
             do=do,
             scale=ctx.scale,
-            chunk_size=ctx.chunk_size,
             cu_seqlens=ctx.cu_seqlens,
         )
         if dg is not None:
@@ -689,10 +677,10 @@ def parallel_attn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = False
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
+    cu_seqlens: torch.LongTensor | None = None,
+    head_first: bool = False,
 ) -> torch.Tensor:
     r"""
     Args:
@@ -722,14 +710,14 @@ def parallel_attn(
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead."
+            "Please use head_first=False for now instead.",
         )
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
             "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
             "when head_first=False was specified. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
         )
     if scale is None:
         scale = k.shape[-1] ** -0.5

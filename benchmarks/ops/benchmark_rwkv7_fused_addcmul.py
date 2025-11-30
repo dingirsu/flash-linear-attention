@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 
 import torch
@@ -27,10 +26,10 @@ def torch_compile_addcmul(hidden_states, delta, x_r, x_w, x_k, x_v, x_a, x_g):
         # argument name whose value corresponds to a different line in the plot
         line_arg='provider',
         line_vals=['addcmul_torch', 'addcmul_triton', 'compile',
-                   'addcmul_torch_bwd', 'addcmul_triton_bwd', 'compile_bwd',],
+                   'addcmul_torch_bwd', 'addcmul_triton_bwd', 'compile_bwd'],
         # label name for the lines
         line_names=['torch', 'triton', 'compile',
-                    'torch_bwd', 'triton_bwd', 'compile_bwd',],
+                    'torch_bwd', 'triton_bwd', 'compile_bwd'],
         # line styles
         styles=[
             ('green', '-'),
@@ -44,19 +43,18 @@ def torch_compile_addcmul(hidden_states, delta, x_r, x_w, x_k, x_v, x_a, x_g):
         # name for the plot. Used also as a file name for saving the plot.
         plot_name="Performance",
         args={},
-    )
+    ),
 )
 def benchmark(T, provider):
     from fla.utils import device
     dtype = torch.bfloat16
     requires_grad = True
-    # Read B, H, D from environment variables, default to 16, 8, 128 if not set
     hidden_size = 4096
     batch_size = 8
     seq_len = T
     hidden_states = torch.randn(batch_size, seq_len, hidden_size, device=device,
                                 requires_grad=requires_grad, dtype=dtype).to(device)
-    delta = torch.randn_like(hidden_states).to(device)
+    delta = torch.randn(batch_size, seq_len, hidden_size).uniform_(-8, 8).to(device).to(dtype).requires_grad_()
     x_r = torch.randn(1, 1, hidden_size).uniform_(-8, 8).to(device).to(dtype).requires_grad_()
     x_w = torch.randn(1, 1, hidden_size).uniform_(-8, 8).to(device).to(dtype).requires_grad_()
     x_k = torch.randn(1, 1, hidden_size).uniform_(-8, 8).to(device).to(dtype).requires_grad_()

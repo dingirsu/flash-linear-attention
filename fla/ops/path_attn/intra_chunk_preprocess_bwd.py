@@ -2,7 +2,8 @@ import torch
 import triton
 import triton.language as tl
 
-from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
+from fla.ops.utils import prepare_chunk_indices
+from fla.utils import check_shared_mem
 
 
 # episold
@@ -11,10 +12,10 @@ from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
 })
 @triton.jit(do_not_specialize=['T'])
 def intra_chunk_preprocess_bwd_kernel(
-    q, k, w, beta,
+    q, k, w, w2, beta,
     AT,
-    dA_local, dq, dq_new, dk, dk_new, dw, dbeta, dh, T,
-    offsets, indices, chunk_offsets,
+    dA_local, dq, dq_new, dk, dk_new, dw, dbeta, dw1, dw2, T,
+    offsets, indices,
     HQ: tl.constexpr, G: tl.constexpr, H: tl.constexpr,
     K: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -27,11 +28,8 @@ def intra_chunk_preprocess_bwd_kernel(
         i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
         bos, eos = tl.load(offsets + i_n).to(tl.int32), tl.load(offsets + i_n + 1).to(tl.int32)
         T = eos - bos
-        boh = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_n * T, i_n * T + T
-        NT = tl.cdiv(T, BT)
-        boh = i_n * NT
 
     b_dk = tl.zeros([BT, BK], dtype=tl.float32)
     b_dw_beta = tl.zeros([BT, BK], dtype=tl.float32)
@@ -41,19 +39,20 @@ def intra_chunk_preprocess_bwd_kernel(
     p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (T, K), (K*H, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     p_w = tl.make_block_ptr(w + (bos * H + i_h) * K, (T, K), (K*H, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    p_w2 = tl.make_block_ptr(w2 + (bos * H + i_h) * K, (T, K), (K*H, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     p_beta = tl.make_block_ptr(beta + (bos * H + i_h), (T, ), (H, ), (i_t * BT, ), (BT, ), (0, ))
     p_T = tl.make_block_ptr(AT + (bos * H + i_h) * BT, (T, BT), (BT*H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     b_w = tl.load(p_w, boundary_check=(0, 1))
+    b_Twb = tl.load(p_w2, boundary_check=(0, 1))
     b_beta = tl.load(p_beta, boundary_check=(0, ))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_k = tl.load(p_k, boundary_check=(0, 1))
-    b_T = tl.load(p_T, boundary_check=(0, 1)).to(b_k.dtype)
+    b_T = tl.load(p_T, boundary_check=(0, 1))
     b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
 
     o_i = tl.arange(0, BT)
     b_qw = tl.where(o_i[:, None] >= o_i[None, :], tl.dot(b_q, tl.trans(b_w)), 0).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w_beta, tl.trans(b_k)), 0).to(b_k.dtype)
-    b_Twb = tl.dot(b_T, b_w_beta).to(b_w.dtype)
     b_Twbk = tl.dot(b_T, b_wbk).to(b_w.dtype)
 
     p_dA_local = tl.make_block_ptr(dA_local + (bos * HQ + i_hq) * BT, (T, BT), (BT*HQ, 1), (i_t * BT, 0), (BT, BT), (1, 0))
@@ -61,15 +60,16 @@ def intra_chunk_preprocess_bwd_kernel(
 
     # # Twb part qw part.
     p_dq = tl.make_block_ptr(dq + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
-    b_dq = tl.load(p_dq, boundary_check=(0, 1)).to(b_w.dtype)
+    b_dq = tl.load(p_dq, boundary_check=(0, 1))
 
-    p_dh = tl.make_block_ptr(dh + ((boh + i_t) * HQ + i_hq)*K*K, (K, K), (K, 1), (0, 0), (BK, BK), (1, 0))
-    b_dh = tl.load(p_dh, boundary_check=(0, 1)).to(b_w.dtype)
-    b_dw += tl.dot(b_Twb, tl.trans(b_dh))
+    p_dw1 = tl.make_block_ptr(dw1 + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dw += tl.load(p_dw1, boundary_check=(0, 1))
+
     b_dqw = -tl.dot(b_dA_local, tl.trans(b_Twbk)) - tl.dot(b_dq.to(b_Twb.dtype), tl.trans(b_Twb))
-    b_dTwb = (-tl.dot(tl.trans(b_qw), b_dq) + tl.dot(b_w, b_dh)).to(b_w.dtype)
-    b_dT += tl.dot(b_dTwb, tl.trans(b_w_beta))
-    b_dw_beta += tl.dot(tl.trans(b_T), b_dTwb)
+    p_dw2 = tl.make_block_ptr(dw2 + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dTwb = -tl.dot(tl.trans(b_qw), b_dq) + tl.load(p_dw2, boundary_check=(0, 1))
+    b_dT += tl.dot(b_dTwb.to(b_w_beta.dtype), tl.trans(b_w_beta))
+    b_dw_beta += tl.dot(tl.trans(b_T), b_dTwb.to(b_T.dtype))
 
     b_dqw = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], b_dqw, 0)
     b_dq += tl.dot(b_dA_local.to(b_k.dtype), b_k)
@@ -111,15 +111,15 @@ def intra_chunk_preprocess_bwd_kernel(
     tl.store(p_dbeta, b_dbeta.to(dbeta.dtype.element_ty), boundary_check=(0, ))
 
 
-def intra_chunk_preprocess_bwd_fn(q, k, w, beta,
-                                  dq, dk, dh, dA_local,
+def intra_chunk_preprocess_bwd_fn(q, k, w, w2, beta,
+                                  dq, dk, dA_local,
+                                  dw1, dw2,
                                   A, L, D, do, scale, cu_seqlens=None):
     BT = A.shape[-1]
     HQ = q.shape[-2]
     B, T, H, K = k.shape
     G = HQ//H
     indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
-    chunk_offsets = prepare_chunk_offsets(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(indices)
     grid = (NT, B*HQ)
     # better precision because h would be of norm smaller than 1 anyways
@@ -130,11 +130,12 @@ def intra_chunk_preprocess_bwd_fn(q, k, w, beta,
     dq_new = torch.empty_like(dq, dtype=q.dtype)
 
     intra_chunk_preprocess_bwd_kernel[grid](
-        q=q, k=k, w=w, beta=beta,
+        q=q, k=k, w=w, w2=w2, beta=beta,
         AT=A,
-        dA_local=dA_local, dq=dq, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dh=dh, T=T,
-        offsets=cu_seqlens, indices=indices, chunk_offsets=chunk_offsets,
+        dA_local=dA_local, dq=dq, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dw1=dw1, dw2=dw2, T=T,
+        offsets=cu_seqlens, indices=indices,
         HQ=HQ, G=G, H=H,
         K=K, BT=BT, BK=triton.next_power_of_2(K),
+        num_stages=3 if check_shared_mem('hopper') else 1,
     )
     return dq_new, dk_new, dbeta, dw

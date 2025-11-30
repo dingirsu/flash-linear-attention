@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 
 import os
-from typing import List
 
 import pytest
 import torch
@@ -29,7 +27,7 @@ from fla.utils import assert_close, device
             (2, 1024, 8, 128, 1, 0.1, torch.float16),
             (2, 1024, 8, 128, 1, 10, torch.float16),
         ]
-    ]
+    ],
 )
 def test_fused_recurrent(
     B: int,
@@ -38,7 +36,7 @@ def test_fused_recurrent(
     D: int,
     scale: float,
     gate_logit_normalizer: float,
-    dtype: torch.dtype
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
 
@@ -104,15 +102,15 @@ def test_fused_recurrent(
             (4, 64, 1, 1, [0, 1, 100, 300, 1200, 2048], torch.float16),
             (4, 128, 1, 1, [0, 200, 512, 1200, 2048], torch.float16),
         ]
-    ]
+    ],
 )
 def test_fused_recurrent_varlen(
     H: int,
     D: int,
     scale: float,
     gate_logit_normalizer: float,
-    cu_seqlens: List[int],
-    dtype: torch.dtype
+    cu_seqlens: list[int],
+    dtype: torch.dtype,
 ):
     torch.manual_seed(42)
 
@@ -130,7 +128,7 @@ def test_fused_recurrent_varlen(
     do = torch.randn_like(v)
 
     refs, ref_hts = [], []
-    for i, (bos, eos) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:])):
+    for i, (bos, eos) in enumerate(zip(cu_seqlens[:-1], cu_seqlens[1:], strict=False)):
         ref, ref_ht = naive_recurrent_simple_gla(
             q=q[:, bos:eos],
             k=k[:, bos:eos],
@@ -187,9 +185,9 @@ def test_fused_recurrent_varlen(
             (1, 1000, 4, 128, 1, 0.1, torch.float16),
             (2, 1000, 4, 128, 0.1, 1, torch.float16),
             (3, 1000, 4, 128, 0.1, 10, torch.float16),
-            (4, 2048, 8, 64, 0.1, 1, torch.float16)
+            (4, 2048, 8, 64, 0.1, 1, torch.float16),
         ]
-    ]
+    ],
 )
 def test_chunk(
     B: int,
@@ -234,7 +232,7 @@ def test_chunk(
         g=g,
         scale=scale,
         initial_state=h0,
-        output_final_state=True
+        output_final_state=True,
     )
     ((tri * do).sum() + (dht * tri_ht).sum()).backward()
     tri_dq, q.grad = q.grad.clone(), None
@@ -261,16 +259,16 @@ def test_chunk(
             (4, 64, [0, 256, 500, 1000], torch.float16),
             (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
-    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set'
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
 def test_chunk_varlen(
     H: int,
     D: int,
-    cu_seqlens: List[int],
+    cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -340,9 +338,9 @@ def test_chunk_varlen(
             (1, 1000, 4, 128, 1, 0.1, torch.float16),
             (2, 1000, 4, 128, 0.1, 1, torch.float16),
             (3, 1000, 4, 128, 0.1, 10, torch.float16),
-            (4, 2048, 8, 64, 0.1, 1, torch.float16)
+            (4, 2048, 8, 64, 0.1, 1, torch.float16),
         ]
-    ]
+    ],
 )
 def test_fused_chunk(
     B: int,
@@ -351,7 +349,7 @@ def test_fused_chunk(
     D: int,
     dtype: torch.dtype,
     scale: float,
-    gate_logit_normalizer: float
+    gate_logit_normalizer: float,
 ):
     torch.manual_seed(42)
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'
@@ -387,7 +385,7 @@ def test_fused_chunk(
         g=g,
         scale=scale,
         initial_state=h0,
-        output_final_state=True
+        output_final_state=True,
     )
     ((tri * do).sum() + (dht * tri_ht).sum()).backward()
     tri_dq, q.grad = q.grad.clone(), None
@@ -414,16 +412,16 @@ def test_fused_chunk(
             (4, 64, [0, 256, 500, 1000], torch.float16),
             (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
-    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set'
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
 def test_fused_chunk_varlen(
     H: int,
     D: int,
-    cu_seqlens: List[int],
+    cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -492,9 +490,9 @@ def test_fused_chunk_varlen(
             (2, 1024, 4, 128, 0.1, 1, torch.float16),
             (3, 1024, 4, 128, 0.1, 10, torch.float16),
             (3, 1024, 4, 256, 0.1, 0.1, torch.float16),
-            (4, 2048, 4, 64, 0.1, 0.1, torch.float16)
+            (4, 2048, 4, 64, 0.1, 0.1, torch.float16),
         ]
-    ]
+    ],
 )
 def test_parallel(
     B: int,
@@ -549,16 +547,16 @@ def test_parallel(
             (4, 64, [0, 256, 500, 1000], torch.float16),
             (4, 100, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
-    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set'
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
 def test_parallel_varlen(
     H: int,
     D: int,
-    cu_seqlens: List[int],
+    cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
@@ -610,11 +608,11 @@ def test_parallel_varlen(
 @pytest.mark.parametrize(
     ('vary_A', 'dtype'),
     [
-        pytest.param(True, torch.float, id='vary_A{}-dtype{}'.format(True, torch.float)),
-        pytest.param(False, torch.float, id='vary_A{}-dtype{}'.format(False, torch.float)),
-        pytest.param(True, torch.float16, id='vary_A{}-dtype{}'.format(True, torch.float16)),
-        pytest.param(False, torch.float16, id='vary_A{}-dtype{}'.format(False, torch.float16))
-    ]
+        pytest.param(True, torch.float, id=f'vary_A{True}-dtype{torch.float}'),
+        pytest.param(False, torch.float, id=f'vary_A{False}-dtype{torch.float}'),
+        pytest.param(True, torch.float16, id=f'vary_A{True}-dtype{torch.float16}'),
+        pytest.param(False, torch.float16, id=f'vary_A{False}-dtype{torch.float16}'),
+    ],
 )
 def test_simple_gla_to_mamba2(vary_A, dtype):
     try:
@@ -654,18 +652,18 @@ def test_simple_gla_to_mamba2(vary_A, dtype):
         assert final_ssd.allclose(final_fuse, 0, atol), f'final diff: {torch.abs(final_ssd - final_fuse).max()}'
 
     # mapping inputs Mamba2 -> FLA
-    # C, B, X: [batch, seq, head, hidden] -> [batch, head, seq, hidden]
-    # g: [batch, seq, head] -> [batch, head, seq]
-    q = C.transpose(1, 2)
-    k = B.transpose(1, 2)
-    v = x.transpose(1, 2)
-    g = (A * dt).transpose(1, 2)
+    # FLA Now use head_first = False, therefore there is no need to transpose inputs
+    q = C
+    k = B
+    v = x
+    g = (A * dt)
 
     # mapping outputs Mamba2 -> FLA
-    y_rearrange = y_ssd.transpose(1, 2)
+    y_rearrange = y_ssd
     final_rearrange = final_ssd.transpose(2, 3)
 
     # comparing output results between FLA kernel and Mamba2 kernel
+    # final_gla_fuse :[N, H, K, V]
     outputs_gla_fuse, final_gla_fuse = chunk_simple_gla(q, k, v, g, scale=1.0, output_final_state=True)
     assert y_rearrange.allclose(outputs_gla_fuse, 0, atol), f'y diff: {torch.abs(y_rearrange - outputs_gla_fuse).max()}'
     final_gla_fuse = final_gla_fuse.to(dtype)  # states hard-coded to float32 in FLA kernel

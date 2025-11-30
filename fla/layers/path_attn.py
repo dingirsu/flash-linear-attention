@@ -1,13 +1,12 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.utils.checkpoint
 from einops import rearrange
 from transformers.utils import logging
 
@@ -15,7 +14,7 @@ from fla.layers.utils import pad_input, unpad_input
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
-from fla.ops.path_attn.parallel import parallel_path_attention
+from fla.ops.path_attn.parallel import parallel_path_attn
 
 if TYPE_CHECKING:
     from fla.models.utils import Cache
@@ -28,11 +27,14 @@ class PaTHAttention(nn.Module):
         self,
         hidden_size: int = 2048,
         num_heads: int = 32,
-        num_kv_heads: Optional[int] = None,
+        num_kv_heads: int | None = None,
         use_forget_gate: bool = False,
         use_qk_norm: bool = False,
-        use_w_shortconv: bool = True,
         layer_idx: int = None,
+        use_low_rank_w: bool = True,
+        use_w_shortconv: bool = True,
+        conv_size: int = 3,
+        conv_bias: bool = False,
     ):
         super().__init__()
 
@@ -52,25 +54,26 @@ class PaTHAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
 
         # We use low-rank parameterization for the w_proj to reduce parameters in MHA settings.
-        if self.num_heads == self.num_kv_heads:
+        if use_low_rank_w:
             self.w_proj = nn.Sequential(
                 nn.Linear(self.hidden_size, 32, bias=False),
-                nn.Linear(32, self.kv_dim, bias=False)
+                nn.Linear(32, self.kv_dim, bias=False),
             )
         # In MQA/GQA settings, key/value heads are shared, so we use a standard linear projection
         # which doesn't introduce too many parameters
         else:
             self.w_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
 
+        # per head norm
         if use_qk_norm:
-            self.maybe_q_norm = RMSNorm(self.hidden_size)
-            self.maybe_k_norm = RMSNorm(self.kv_dim)
+            self.maybe_q_norm = RMSNorm(self.head_dim)
+            self.maybe_k_norm = RMSNorm(self.head_dim)
         else:
             self.maybe_q_norm = nn.Identity()
             self.maybe_k_norm = nn.Identity()
 
         if use_w_shortconv:
-            self.w_conv1d = ShortConvolution(self.kv_dim, 3)
+            self.w_conv1d = ShortConvolution(hidden_size=self.kv_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
         self.use_w_shortconv = use_w_shortconv
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads, bias=True)
         self.use_forget_gate = use_forget_gate
@@ -81,12 +84,12 @@ class PaTHAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        attention_mask: torch.LongTensor | None = None,
+        past_key_values: Cache | None = None,
         output_attentions: bool = False,
         use_cache: bool = False,
         **kwargs,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         if use_cache:
             assert past_key_values is not None, "past_key_values must be provided when use_cache is True"
         if attention_mask is not None:
@@ -100,10 +103,9 @@ class PaTHAttention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         w = self.w_proj(hidden_states)
-        beta = self.bt_proj(hidden_states).sigmoid() * 2  # allowing negative eigenvalues
+        beta = self.bt_proj(hidden_states).float().sigmoid() * 2  # allowing negative eigenvalues
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
-        q, k = self.maybe_q_norm(q), self.maybe_k_norm(k)
-        cu_seqlens = kwargs.get('cu_seqlens', None)
+        cu_seqlens = kwargs.get('cu_seqlens')
         assert not (cu_seqlens is not None and attention_mask is not None), (
             "cu_seqlens should not be provided when attention_mask is not None"
         )
@@ -116,8 +118,9 @@ class PaTHAttention(nn.Module):
             k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
             v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
             w = rearrange(w, '... (h d) -> ... h d', d=self.head_dim)
-            w = l2_norm(w)
-            o, _ = parallel_path_attention(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+            q, k = self.maybe_q_norm(q), self.maybe_k_norm(k)
+            w = l2_norm(w, output_dtype=torch.float32)
+            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
 
         # Prefilling or decoding
         else:
@@ -132,13 +135,15 @@ class PaTHAttention(nn.Module):
                     past_k, past_v, past_g = last_state['attn_state']
                 else:
                     past_k, past_v = last_state['attn_state']
+                    past_g = None
                 w_conv_state = last_state['conv_state']
                 past_k = rearrange(past_k, '... (h d) -> ... h d', d=self.head_dim)
                 if self.use_w_shortconv:
                     w, w_conv_state = self.w_conv1d(w, cache=w_conv_state, output_final_state=use_cache, cu_seqlens=cu_seqlens)
                 w = rearrange(w, '... (h d) -> ... h d', d=self.head_dim)
-                w = l2_norm(w)
+                w = l2_norm(w, output_dtype=torch.float32)
 
+                @torch.compile
                 def rank_one_update(k, w, beta):
                     original_dtype = k.dtype
                     k = k.float()
@@ -156,7 +161,7 @@ class PaTHAttention(nn.Module):
                 past_key_values.update(
                     conv_state=w_conv_state,
                     layer_idx=self.layer_idx,
-                    offset=q_len
+                    offset=q_len,
                 )
                 if g is not None:
                     q, (k, v, g), indices_q, cu_seqlens, max_seq_lens = unpad_input(
@@ -187,13 +192,15 @@ class PaTHAttention(nn.Module):
                 _, cu_seqlens = cu_seqlens
                 if self.use_w_shortconv:
                     w, w_conv_state = self.w_conv1d(w, cache=None, output_final_state=use_cache, cu_seqlens=cu_seqlens)
+                else:
+                    w_conv_state = None
                 q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
                 k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
                 v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
                 w = rearrange(w, '... (h d) -> ... h d', d=self.head_dim)
-                w = l2_norm(w)
-                o, k_cache = parallel_path_attention(q=q, k=k, v=v, w=w, beta=beta, g=g,
-                                                     cu_seqlens=cu_seqlens, use_cache=use_cache)
+                w = l2_norm(w, output_dtype=torch.float32)
+                o, k_cache = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g,
+                                                cu_seqlens=cu_seqlens, use_cache=use_cache)
                 if use_cache:
                     k_cache = pad_input(k_cache.squeeze(0), indices_q, batch_size, q_len)
                     k_cache = rearrange(k_cache, '... h d -> ... (h d)')
@@ -201,7 +208,7 @@ class PaTHAttention(nn.Module):
                         attn_state=(k_cache, v_cache, g_cache) if g_cache is not None else (k_cache, v_cache),
                         conv_state=w_conv_state,
                         layer_idx=self.layer_idx,
-                        offset=q_len
+                        offset=q_len,
                     )
             o = pad_input(o.squeeze(0), indices_q, batch_size, q_len)
         o = rearrange(o, '... h d -> ... (h d)')

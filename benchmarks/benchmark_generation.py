@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2024, Songlin Yang, Yu Zhang.
 
 import argparse
@@ -24,11 +23,12 @@ if __name__ == "__main__":
     parser.add_argument("--path", type=str, default="fla-hub/transformer-1.3B-100B")
     parser.add_argument("--data", type=str, default="fla-hub/pg19")
     parser.add_argument("--length", type=int, default=128)
-    parser.add_argument("--maxlen", type=int, default=128)
+    parser.add_argument("--maxlen", type=int, default=256)
     parser.add_argument("--no-cache", action='store_true')
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--topp", type=float, default=0.2)
     parser.add_argument("--repetition_penalty", type=float, default=1.1)
+    parser.add_argument("--output-generation", action='store_true')
     parser.add_argument("--compile", action='store_true')
     args = parser.parse_args()
 
@@ -40,7 +40,7 @@ if __name__ == "__main__":
     tokenizer = AutoTokenizer.from_pretrained(
         args.path,
         trust_remote_code=True,
-        add_eos_token=False
+        add_eos_token=False,
     )
     tokenizer.pad_token_id = tokenizer.eos_token_id
     print(f"{tokenizer}")
@@ -49,7 +49,7 @@ if __name__ == "__main__":
         args.path,
         device_map={"": device},
         torch_dtype=dtype,
-        use_cache=not args.no_cache
+        use_cache=not args.no_cache,
     )
     if args.compile:
         print("Compiling the model")
@@ -78,12 +78,13 @@ if __name__ == "__main__":
             do_sample=True,
             temperature=args.temperature,
             top_p=args.topp,
-            repetition_penalty=args.repetition_penalty
+            repetition_penalty=args.repetition_penalty,
         )
     torch.cuda.synchronize()
     elapsed = time.time() - start
-    print(f"Prompt:\n{tokenizer.batch_decode(input_ids, skip_special_tokens=True)[0].strip()}\n")
-    print(f"Generated:\n{tokenizer.batch_decode(text, skip_special_tokens=True)[0].strip()}\n")
+    if args.output_generation:
+        print(f"Prompt:\n{tokenizer.batch_decode(input_ids, skip_special_tokens=True)[0].strip()}\n")
+        print(f"Generated:\n{tokenizer.batch_decode(text, skip_special_tokens=True)[0].strip()}\n")
     print(f"Prompt length: {len(input_ids[0])}, generation length: {len(text[0]) - len(input_ids[0])}")
     print(f"Total prompt processing + decoding time: {elapsed * 1000:.0f}ms")
     print(f"Max memory used: {sizeof_fmt(torch.cuda.max_memory_allocated())}")

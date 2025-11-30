@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -9,7 +7,7 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_offsets
 from fla.ops.utils.op import exp
-from fla.utils import check_shared_mem
+from fla.utils import autotune_cache_kwargs, check_shared_mem
 
 BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 
@@ -17,7 +15,7 @@ BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h0'] is not None,
     'STORE_FINAL_STATE': lambda args: args['ht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -27,7 +25,8 @@ BKV_LIST = [32, 64] if check_shared_mem() else [16, 32]
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_fwd_kernel_h(
@@ -143,7 +142,7 @@ def chunk_fwd_kernel_h(
 @triton.heuristics({
     'STORE_INITIAL_STATE_GRADIENT': lambda args: args['dh0'] is not None,
     'USE_FINAL_STATE_GRADIENT': lambda args: args['dht'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -153,7 +152,8 @@ def chunk_fwd_kernel_h(
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT', 'USE_G', 'USE_GK', 'USE_GV']
+    key=['BT', 'USE_G', 'USE_GK', 'USE_GV'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_bwd_kernel_dh(
@@ -269,20 +269,20 @@ def chunk_bwd_kernel_dh(
 def chunk_fwd_h(
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    gv: Optional[torch.Tensor] = None,
-    h0: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    gv: torch.Tensor | None = None,
+    h0: torch.Tensor | None = None,
     output_final_state: bool = False,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
-    split_size: Optional[int] = None,
-    states_in_fp32: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    split_size: int | None = None,
+    states_in_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    BS = BT if split_size is None else min(split_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
+    BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
@@ -328,19 +328,19 @@ def chunk_bwd_dh(
     h0: torch.Tensor,
     dht: torch.Tensor,
     scale: float,
-    g: Optional[torch.Tensor] = None,
-    g_gamma: Optional[torch.Tensor] = None,
-    gk: Optional[torch.Tensor] = None,
-    gv: Optional[torch.Tensor] = None,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    g: torch.Tensor | None = None,
+    g_gamma: torch.Tensor | None = None,
+    gk: torch.Tensor | None = None,
+    gv: torch.Tensor | None = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
-    split_size: Optional[int] = None,
-    states_in_fp32: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    split_size: int | None = None,
+    states_in_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     HQ = q.shape[2]
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    BS = BT if split_size is None else min(split_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
+    BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     # N: the actual number of sequences in the batch with either equal or variable lengths
     # NG: number of groups in GQA

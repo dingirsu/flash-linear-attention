@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
 
 import math
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -28,14 +27,14 @@ class Comba(nn.Module):
 
     Similar to Mamba2 and Gated-DeltaNet, each layer contains around 6*hidden_size*hidden_size parameters.
 
-    Parameter alloation when use_gate=True:
+    Parameter alloation when use_output_gate=True:
         - 0.75 * hidden_size * hidden_size for the q_proj and k_proj each
         - 1.5 * hidden_size * hidden_size for the v_proj, g_proj and o_proj each
         - Others are ignorably small.
         - In total = 0.75 * 2 + 1.5 * 3 = 6 * hidden_size * hidden_size
     NOTE: num_heads * head_dim = 0.75 * hidden_size, please make sure to set the correct num_heads and head_dim.
 
-    Parameter allocation when use_gate=False:
+    Parameter allocation when use_output_gate=False:
         - 1 * hidden_size * hidden_size for the q_proj and k_proj each
         - 2 * hidden_size * hidden_size for the v_proj and o_proj each
         - Others are ignorably small.
@@ -59,10 +58,10 @@ class Comba(nn.Module):
             Default: `chunk`.
         use_beta (bool, Optional):
             Whether to use beta. Default: `True`.
+        use_output_gate (bool, Optional):
+            Whether to use output gate. Default: `True`.
         use_output_correction (bool, Optional):
             Whether to use <q-dk>. Default: `True`.
-        use_gate (bool, Optional):
-            Whether to use output gate. Default: `True`.
         use_short_conv (bool, Optional):
             Whether to use short convolutions. Default: `True`.
         conv_size (int, Optional):
@@ -83,8 +82,8 @@ class Comba(nn.Module):
         num_heads: int = 6,
         num_v_heads: int = None,
         mode: str = 'chunk',
-        use_gate: bool = True,
         use_short_conv: bool = True,
+        use_output_gate: bool = True,
         use_output_correction: bool = True,
         use_inner_decay: bool = True,
         correction_factor: float = 1.,
@@ -92,7 +91,7 @@ class Comba(nn.Module):
         conv_bias: bool = False,
         layer_idx: int = None,
         norm_eps: float = 1e-5,
-        **kwargs
+        **kwargs,
     ) -> Comba:
         super().__init__()
 
@@ -101,8 +100,8 @@ class Comba(nn.Module):
         self.hidden_size = hidden_size
         self.expand_v = expand_v
 
-        self.use_gate = use_gate
         self.use_short_conv = use_short_conv
+        self.use_output_gate = use_output_gate
         self.use_output_correction = use_output_correction
         self.use_inner_decay = use_inner_decay
         self.conv_size = conv_size
@@ -122,17 +121,17 @@ class Comba(nn.Module):
         if not math.isclose(self.num_v_heads * self.head_dim * expand_v, self.value_dim, rel_tol=1e-5):
             raise ValueError(
                 f"expand_v={expand_v} does not produce an integer value when multiplied by key_dim={self.key_dim}. "
-                f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear."
+                f"Resulting value_dim would be {self.num_v_heads * self.head_dim * expand_v}, which is invalid for nn.Linear.",
             )
         if self.num_v_heads > self.num_heads and self.num_v_heads % self.num_heads != 0:
             raise ValueError(
-                f"num_v_heads={self.num_v_heads} must be divisible by num_heads={self.num_heads}."
+                f"num_v_heads={self.num_v_heads} must be divisible by num_heads={self.num_heads}.",
             )
 
         if not math.isclose(head_dim * expand_v, self.head_v_dim, rel_tol=1e-5):
             raise ValueError(
                 f"expand_v={expand_v} does not produce an integer value when multiplied by head_dim={head_dim}. "
-                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated."
+                f"Resulting head_v_dim would be {head_dim * expand_v}, which is invalid for FusedRMSNormGated.",
             )
         assert mode in ['chunk', 'fused_recurrent'], f"Not supported mode `{mode}`."
 
@@ -149,7 +148,7 @@ class Comba(nn.Module):
             warnings.warn(
                 "The correction_factor is set to 1 by default similar to Mamba2. "
                 "However, we find that sometimes correction_factor = 0.02 works better for small-scale models. "
-                "In practice, we recommend trying both settings. "
+                "In practice, we recommend trying both settings. ",
             )
             self.D = nn.Parameter(torch.ones(self.num_heads) * correction_factor)
             self.D._no_weight_decay = True
@@ -163,7 +162,7 @@ class Comba(nn.Module):
         dt_init_floor = 1e-4
         dt = torch.exp(
             torch.rand(self.num_v_heads) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
+            + math.log(dt_min),
         )
         dt = torch.clamp(dt, min=dt_init_floor)
         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
@@ -179,26 +178,26 @@ class Comba(nn.Module):
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu'
+                activation='silu',
             )
             self.k_conv1d = ShortConvolution(
                 hidden_size=self.key_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu'
+                activation='silu',
             )
             self.v_conv1d = ShortConvolution(
                 hidden_size=self.value_dim,
                 kernel_size=conv_size,
                 bias=conv_bias,
-                activation='silu'
+                activation='silu',
             )
         else:
             warnings.warn(
                 "ShortConvolution is crucial to the performance. "
-                "Do not turn it off, i.e., setting `use_short_conv=False` unless you know what you are doing."
+                "Do not turn it off, i.e., setting `use_short_conv=False` unless you know what you are doing.",
             )
-        if use_gate:
+        if use_output_gate:
             self.g_proj = nn.Linear(hidden_size, self.value_dim, bias=False)
             self.o_norm = FusedRMSNormGated(self.head_v_dim, activation='sigmoid', eps=norm_eps)
         else:
@@ -208,12 +207,12 @@ class Comba(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[Cache] = None,
-        use_cache: Optional[bool] = False,
-        output_attentions: Optional[bool] = False,
-        **kwargs: Unpack[Dict]
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Cache]]:
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Cache | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Unpack[dict],
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Cache | None]:
         if attention_mask is not None:
             assert len(attention_mask.shape) == 2, (
                 "Expected attention_mask as a 0-1 matrix with shape [batch_size, seq_len] "
@@ -223,15 +222,14 @@ class Comba(nn.Module):
 
         batch_size, q_len, _ = hidden_states.shape
         # change to inference mode.
-        mode = 'fused_recurrent' if q_len <= 64 else self.mode
+        mode = 'fused_recurrent' if (q_len <= 64 and not self.training) else self.mode
         if self.training:
             assert mode == 'chunk', "Only chunk mode is supported in training."
-
         last_state = None
         if past_key_values is not None and len(past_key_values) > self.layer_idx:
             last_state = past_key_values[self.layer_idx]
 
-        cu_seqlens = kwargs.get('cu_seqlens', None)
+        cu_seqlens = kwargs.get('cu_seqlens')
         if attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
@@ -244,19 +242,19 @@ class Comba(nn.Module):
                 x=self.q_proj(hidden_states),
                 cache=conv_state_q,
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens
+                cu_seqlens=cu_seqlens,
             )
             k, conv_state_k = self.k_conv1d(
                 x=self.k_proj(hidden_states),
                 cache=conv_state_k,
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens
+                cu_seqlens=cu_seqlens,
             )
             v, conv_state_v = self.v_conv1d(
                 x=self.v_proj(hidden_states),
                 cache=conv_state_v,
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens
+                cu_seqlens=cu_seqlens,
             )
         else:
             q = F.silu(self.q_proj(hidden_states))
@@ -293,7 +291,7 @@ class Comba(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True
+                use_qk_l2norm_in_kernel=True,
             )
         elif mode == 'fused_recurrent':
             o, recurrent_state = fused_recurrent_comba(
@@ -306,7 +304,7 @@ class Comba(nn.Module):
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
                 cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True
+                use_qk_l2norm_in_kernel=True,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
@@ -316,10 +314,10 @@ class Comba(nn.Module):
                 recurrent_state=recurrent_state,
                 conv_state=(conv_state_q, conv_state_k, conv_state_v) if self.use_short_conv else None,
                 layer_idx=self.layer_idx,
-                offset=q_len
+                offset=q_len,
             )
 
-        if self.use_gate:
+        if self.use_output_gate:
             g = rearrange(self.g_proj(hidden_states), '... (h d) -> ... h d', d=self.head_v_dim)
             o = self.o_norm(o, g)
         else:

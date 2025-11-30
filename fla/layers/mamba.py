@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
@@ -27,9 +26,7 @@ with warnings.catch_warnings():
     is_fast_path_available = all((
         selective_state_update,
         selective_scan_fn,
-        causal_conv1d_fn,
-        causal_conv1d_update,
-        mamba_inner_fn
+        mamba_inner_fn,
     ))
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
@@ -58,6 +55,7 @@ class Mamba(nn.Module):
         use_bias: bool = True,
         hidden_act: str = "silu",
         layer_idx: int = None,
+        backend: str = "cuda",
     ):
         super().__init__()
 
@@ -105,16 +103,35 @@ class Mamba(nn.Module):
                 "`(selective_state_update, selective_scan_fn, causal_conv1d_fn, causal_conv1d_update, mamba_inner_fn)`"
                 " is None. Falling back to the naive implementation. "
                 "To install follow https://github.com/state-spaces/mamba/#installation and"
-                " https://github.com/Dao-AILab/causal-conv1d"
+                " https://github.com/Dao-AILab/causal-conv1d",
             )
+        import os
+        backend = os.environ.get('FLA_CONV_BACKEND', backend)
+        assert backend in ['cuda', 'triton'], f"Unsupported backend: {backend}"
+        if backend == 'cuda' and causal_conv1d_fn is None:
+            logger.warning_once(
+                "The CUDA backend is not available because `causal_conv1d` is None. "
+                "Falling back to the Triton backend. "
+                "To install follow https://github.com/Dao-AILab/causal-conv1d",
+            )
+            backend = 'triton'
+        if backend == 'triton':
+            from fla.modules.convolution import causal_conv1d as causal_conv1d_triton
+            from fla.modules.convolution import causal_conv1d_update as causal_conv1d_update_triton
+            self.causal_conv1d_fn = causal_conv1d_triton
+            self.causal_conv1d_update = causal_conv1d_update_triton
+        else:
+            self.causal_conv1d_fn = causal_conv1d_fn
+            self.causal_conv1d_update = causal_conv1d_update
+        self.backend = backend
 
     def cuda_kernels_forward(
         self,
         hidden_states: torch.Tensor,
-        cache_params: Optional[MambaCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[Dict]
+        cache_params: MambaCache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        **kwargs: Unpack[dict],
     ):
         # 1. Gated MLP's linear projection
         projected_states = self.in_proj(hidden_states).transpose(1, 2)
@@ -145,7 +162,7 @@ class Mamba(nn.Module):
             # 2. Convolution sequence transformation
             conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
             if cache_params is not None and cache_position[0] > 0:
-                hidden_states = causal_conv1d_update(
+                hidden_states = self.causal_conv1d_update(
                     hidden_states.squeeze(-1),
                     cache_params.conv_states[self.layer_idx],
                     conv_weights,
@@ -156,11 +173,11 @@ class Mamba(nn.Module):
             else:
                 if cache_params is not None:
                     conv_states = nn.functional.pad(
-                        hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0)
+                        hidden_states, (self.conv_kernel_size - hidden_states.shape[-1], 0),
                     )
                     cache_params.update_conv_state(self.layer_idx, conv_states, cache_position)
-                hidden_states = causal_conv1d_fn(
-                    hidden_states, conv_weights, self.conv1d.bias, activation=self.activation
+                hidden_states = self.causal_conv1d_fn(
+                    hidden_states, conv_weights, self.conv1d.bias, activation=self.activation,
                 )
 
             if attention_mask is not None:
@@ -170,7 +187,7 @@ class Mamba(nn.Module):
             # 3.a. input varying initialization of time_step, B and C
             ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
             time_step, B, C = torch.split(
-                ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
+                ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1,
             )
             discrete_time_step = self.dt_proj.weight @ time_step.transpose(1, 2)
 
@@ -213,10 +230,10 @@ class Mamba(nn.Module):
     def slow_forward(
         self,
         input_states,
-        cache_params: Optional[MambaCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[Dict]
+        cache_params: MambaCache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        **kwargs: Unpack[dict],
     ):
         batch_size, seq_len, _ = input_states.shape
         dtype = input_states.dtype
@@ -238,7 +255,7 @@ class Mamba(nn.Module):
             if cache_position.shape[0] == self.conv_kernel_size:
                 conv_state = nn.functional.pad(
                     hidden_states,
-                    (self.conv_kernel_size - hidden_states.shape[-1], 0)
+                    (self.conv_kernel_size - hidden_states.shape[-1], 0),
                 )
 
                 cache_params.update_conv_state(self.layer_idx, conv_state, cache_position)
@@ -254,7 +271,7 @@ class Mamba(nn.Module):
         else:
             ssm_state = torch.zeros(
                 (batch_size, self.intermediate_size, self.ssm_state_size),
-                device=hidden_states.device, dtype=dtype
+                device=hidden_states.device, dtype=dtype,
             )
             # [batch, intermediate_size, seq_len]
             hidden_states = self.act(self.conv1d(hidden_states)[..., :seq_len])
@@ -266,7 +283,7 @@ class Mamba(nn.Module):
         # 3.a. Selection:  [batch, seq_len, self.time_step_rank + self.ssm_state_size * 2]
         ssm_parameters = self.x_proj(hidden_states.transpose(1, 2))
         time_step, B, C = torch.split(
-            ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1
+            ssm_parameters, [self.time_step_rank, self.ssm_state_size, self.ssm_state_size], dim=-1,
         )
         # [batch, seq_len, intermediate_size]
         discrete_time_step = self.dt_proj(time_step)
@@ -307,10 +324,10 @@ class Mamba(nn.Module):
     def forward(
         self,
         hidden_states,
-        cache_params: Optional[MambaCache] = None,
-        cache_position: Optional[torch.LongTensor] = None,
-        attention_mask: Optional[torch.LongTensor] = None,
-        **kwargs: Unpack[Dict]
+        cache_params: MambaCache | None = None,
+        cache_position: torch.LongTensor | None = None,
+        attention_mask: torch.LongTensor | None = None,
+        **kwargs: Unpack[dict],
     ):
         if is_fast_path_available and "cuda" in self.x_proj.weight.device.type:
             return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask, **kwargs)

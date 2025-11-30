@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import torch
@@ -6,6 +5,7 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.op import exp
+from fla.utils import input_guard
 
 
 @triton.jit
@@ -14,13 +14,13 @@ def mesa_net_decoding_one_step_kernel(
     k,
     v,
     g,
+    o,
     lamb,
     beta,
     prev_h_kk,
     prev_h_kv,
     curr_h_kk,
     curr_h_kv,
-    o,
     B: tl.constexpr,
     H: tl.constexpr,
     K: tl.constexpr,
@@ -76,7 +76,7 @@ def mesa_net_decoding_one_step_kernel(
     b_x = b_q / (b_h_kk_diag + b_lamb + 1e-5)
     b_Hx = tl.sum(b_h_kk * b_x[:, None], axis=0)
     b_r = b_q - b_Hx - b_lamb * b_x
-    b_p = tl.zeros([BK,], dtype=tl.float32)
+    b_p = tl.zeros([BK], dtype=tl.float32)
     b_p += b_r
     delta_old = tl.sum(b_r * b_r)
 
@@ -95,55 +95,80 @@ def mesa_net_decoding_one_step_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), mask=mask_v)
 
 
-def mesa_net_decoding_one_step(q, k, v, g, lamb, beta, prev_h_kk, prev_h_kv, max_CG_iteration=30):
+@input_guard
+def mesa_net_decoding_one_step(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    lamb: torch.Tensor,
+    beta: torch.Tensor,
+    prev_h_kk: torch.Tensor,
+    prev_h_kv: torch.Tensor,
+    max_CG_iteration: int = 30,
+):
     """
     Triton implementation of Mesa Net CG one step
 
     Args:
-        q: Query tensor [B, H, K]
-        k: Key tensor [B, H, K]
-        v: Value tensor [B, H, V]
-        g: Gate tensor [B, H]
-        lamb: Lambda tensor [H, K]
-        beta: Beta tensor [B, H]
-        prev_h_kk: Previous hidden state KK [B, H, K, K]
-        prev_h_kv: Previous hidden state KV [B, H, K, V]
-        max_CG_iteration: Maximum CG iterations
+        q (torch.Tensor):
+            query tensor [B, H, K]
+        k (torch.Tensor):
+            key tensor [B, H, K]
+        v (torch.Tensor):
+            value tensor [B, H, V]
+        g (torch.Tensor):
+            gate tensor [B, H]
+        lamb (torch.Tensor):
+            lambda tensor [H, K]
+        beta (torch.Tensor):
+            beta tensor [B, H]
+        prev_h_kk (torch.Tensor):
+            previous hidden state KK [B, H, K, K]
+        prev_h_kv (torch.Tensor):
+            previous hidden state KV [B, H, K, V]
+        max_CG_iteration (int):
+            maximum CG iterations
 
     Returns:
-        o: Output tensor [B, H, V]
-        h_kk_new: Updated hidden state KK [B, H, K, K]
-        h_kv_new: Updated hidden state KV [B, H, K, V]
+        o (torch.Tensor):
+            output tensor [B, H, V]
+        h_kk_new (torch.Tensor):
+            updated hidden state KK [B, H, K, K]
+        h_kv_new (torch.Tensor):
+            updated hidden state KV [B, H, K, V]
     """
-    B, H, K = q.shape
-    _, _, V = v.shape
+    B, H, K, V = *q.shape, v.shape[-1]
 
-    q = q.contiguous()
-    k = k.contiguous()
-    v = v.contiguous()
-    g = g.contiguous()
-    lamb = lamb.contiguous()
-    beta = beta.contiguous()
-    prev_h_kk = prev_h_kk.contiguous()
-    prev_h_kv = prev_h_kv.contiguous()
     o = torch.empty((B, H, V), dtype=q.dtype, device=q.device)
     curr_h_kk = torch.empty_like(prev_h_kk)
     curr_h_kv = torch.empty_like(prev_h_kv)
 
-    BK = triton.next_power_of_2(K)
-    BV = triton.next_power_of_2(V)
+    BK = max(triton.next_power_of_2(K), 16)
+    BV = max(triton.next_power_of_2(V), 16)
 
     assert BK <= 128 and BV <= 128, "BK and BV must be less than or equal to 128"
 
     grid = (B * H,)
     mesa_net_decoding_one_step_kernel[grid](
-        q=q, k=k, v=v, g=g, lamb=lamb, beta=beta,
-        prev_h_kk=prev_h_kk, prev_h_kv=prev_h_kv,
-        curr_h_kk=curr_h_kk, curr_h_kv=curr_h_kv,
+        q=q,
+        k=k,
+        v=v,
+        g=g,
         o=o,
-        B=B, H=H, K=K, V=V,
-        BK=BK, BV=BV,
+        lamb=lamb,
+        beta=beta,
+        prev_h_kk=prev_h_kk,
+        prev_h_kv=prev_h_kv,
+        curr_h_kk=curr_h_kk,
+        curr_h_kv=curr_h_kv,
+        B=B,
+        H=H,
+        K=K,
+        V=V,
+        BK=BK,
+        BV=BV,
         MAX_CG_STEP=max_CG_iteration,
-        num_warps=4 if BK <= 64 else 8
+        num_warps=4 if BK <= 64 else 8,
     )
     return o, curr_h_kk, curr_h_kv

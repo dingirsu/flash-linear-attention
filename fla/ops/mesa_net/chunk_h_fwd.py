@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -9,12 +7,13 @@ import triton.language as tl
 
 from fla.ops.utils import prepare_chunk_offsets
 from fla.ops.utils.op import exp
+from fla.utils import autotune_cache_kwargs
 
 
 @triton.heuristics({
     'USE_INITIAL_STATE': lambda args: args['h_init'] is not None,
     'STORE_FINAL_STATE': lambda args: args['h_final'] is not None,
-    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None
+    'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -22,7 +21,8 @@ from fla.ops.utils.op import exp
         for num_warps in [1, 2, 4, 8]
         for num_stages in [2, 3, 4]
     ],
-    key=['BT']
+    key=['BT'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def chunk_mesa_net_fwd_kernel_h(
@@ -121,15 +121,15 @@ def chunk_mesa_fwd_h(
     h_init: torch.Tensor,
     h_kv_init: torch.Tensor,
     output_final_state: bool,
-    cu_seqlens: Optional[torch.Tensor] = None,
+    cu_seqlens: torch.Tensor | None = None,
     chunk_size: int = 64,
-    split_size: Optional[int] = None,
-    states_in_fp32: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    split_size: int | None = None,
+    states_in_fp32: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, K, V = *k.shape, v.shape[-1]
     assert K == V, "K must be equal to V for now"
-    BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
-    BS = BT if split_size is None else min(split_size, max(16, triton.next_power_of_2(T)))
+    BT = chunk_size
+    BS = BT if split_size is None else split_size
     assert BS % BT == 0, f"The `split_size` (got {BS}) must be a multiple of `chunk_size` {BT}"
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:

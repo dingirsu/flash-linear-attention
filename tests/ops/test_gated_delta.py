@@ -1,7 +1,6 @@
-# -*- coding: utf-8 -*-
+# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import os
-from typing import List
 
 import pytest
 import torch
@@ -9,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
-from fla.utils import assert_close, device, is_intel_alchemist
+from fla.utils import IS_INTEL_ALCHEMIST, assert_close, device
 
 
 def recurrent_gated_delta_rule_ref(
@@ -86,7 +85,7 @@ def chunk_gated_delta_rule_ref(
     mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
     q, k, v, k_beta, decay = map(
         lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=chunk_size),
-        [q, k, v, k_beta, decay.unsqueeze(-1)]
+        [q, k, v, k_beta, decay.unsqueeze(-1)],
     )
     decay = decay.squeeze(-1).cumsum(-1)
     decay_exp = decay.exp()[..., None]
@@ -136,7 +135,7 @@ def chunk_gated_delta_rule_ref(
             (2, 1024, 4, 4, 128, 1, 0.1, torch.float16),
             (2, 1024, 4, 8, 128, 1, 10, torch.float16),
         ]
-    ]
+    ],
 )
 def test_fused_recurrent(
     B: int,
@@ -187,7 +186,7 @@ def test_fused_recurrent(
     [
         pytest.param(
             *test,
-            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(*test)
+            id="B{}-T{}-H{}-D{}-scale{}-gate_logit_normalizer{}-mask_p{}-use_qk_l2norm_in_kernel{}-{}".format(*test),
         )
         for test in [
             (1, 63, 1, 64, 1, 1, 0, False, torch.float16),
@@ -197,9 +196,9 @@ def test_fused_recurrent(
             (4, 1024, 4, 128, 0.1, 1, 0, False, torch.float16),
             (4, 1024, 4, 128, 0.1, 1, 0, True, torch.float16),
             (2, 1500, 4, 128, 0.1, 10, 0, False, torch.float16),
-            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16)
+            (4, 2048, 8, 64, 0.1, 1, 0, False, torch.float16),
         ]
-    ]
+    ],
 )
 def test_chunk(
     B: int,
@@ -213,7 +212,7 @@ def test_chunk(
     dtype: torch.dtype,
 ):
     torch.manual_seed(42)
-    if is_intel_alchemist and D > 128:
+    if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(reason='chunk_gated_delta_rule is not supported on alchemist for D>128')
 
     q = torch.rand(B, T, H, D, dtype=dtype)
@@ -276,20 +275,20 @@ def test_chunk(
             (4, 64, 0.5, [0, 256, 500, 1000], torch.float16),
             (4, 100, 0, [0, 15, 100, 300, 1200, 2000], torch.float16),
         ]
-    ]
+    ],
 )
 @pytest.mark.skipif(
     os.getenv('SKIP_TEST_CHUNK_VARLEN') == '1',
-    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set'
+    reason='Skipping test_chunk_varlen because SKIP_TEST_CHUNK_VARLEN is set',
 )
 def test_chunk_varlen(
     H: int,
     D: int,
     mask_p: float,
-    cu_seqlens: List[int],
+    cu_seqlens: list[int],
     dtype: torch.dtype,
 ):
-    if is_intel_alchemist and D > 128:
+    if IS_INTEL_ALCHEMIST and D > 128:
         pytest.skip(reason='chunk_gated_delta_rule is not supported on alchemist for D>128')
     torch.manual_seed(42)
     os.environ['TRITON_F32_DEFAULT'] = 'ieee'

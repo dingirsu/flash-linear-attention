@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
 import warnings
-from typing import Optional, Tuple
 
 import torch
 import triton
@@ -12,17 +10,18 @@ from fla.ops.utils import prepare_chunk_indices
 from fla.ops.utils.cumsum import chunk_global_cumsum, chunk_local_cumsum
 from fla.ops.utils.op import exp
 from fla.utils import (
+    IS_INTEL_ALCHEMIST,
+    IS_NVIDIA_HOPPER,
     autocast_custom_bwd,
     autocast_custom_fwd,
+    autotune_cache_kwargs,
     check_shared_mem,
     input_guard,
-    is_intel_alchemist,
-    is_nvidia_hopper
 )
 
 # https://github.com/intel/intel-xpu-backend-for-triton/issues/3449
-triton_config = {'grf_mode': 'large'} if is_intel_alchemist else {}
-NUM_WARPS = [2, 4, 8] if is_nvidia_hopper else [2, 4, 8, 16]
+triton_config = {'grf_mode': 'large'} if IS_INTEL_ALCHEMIST else {}
+NUM_WARPS = [2, 4, 8] if IS_NVIDIA_HOPPER else [2, 4, 8, 16]
 
 
 @triton.heuristics({
@@ -38,6 +37,7 @@ NUM_WARPS = [2, 4, 8] if is_nvidia_hopper else [2, 4, 8, 16]
         for num_stages in [2, 3, 4]
     ],
     key=["BT", "BS", "BK", "BV", "USE_G"],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def parallel_simple_gla_fwd_kernel(
@@ -62,7 +62,7 @@ def parallel_simple_gla_fwd_kernel(
     NV: tl.constexpr,
     OUTPUT_ATTENTIONS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_k, i_v = i_kv // NV, i_kv % NV
@@ -179,7 +179,7 @@ def parallel_simple_gla_bwd_kernel_dq(
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     p_do = tl.make_block_ptr(do, (T, V), (H*V, 1), (i_t * BT, i_v * BV), (BT, BV), (1, 0))
     # [BT, BV]
@@ -272,7 +272,7 @@ def parallel_simple_gla_bwd_kernel_dkv(
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     o_k = i_t * BT + tl.arange(0, BT)
     m_k = o_k < T
@@ -372,6 +372,7 @@ def parallel_simple_gla_bwd_kernel_dkv(
         for num_warps in NUM_WARPS
     ],
     key=['BT', 'BS', 'BK', 'BV', 'USE_G'],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=['T'])
 def parallel_simple_gla_bwd_kernel(
@@ -398,7 +399,7 @@ def parallel_simple_gla_bwd_kernel(
     BV: tl.constexpr,
     NV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     i_kv, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_k, i_v = i_kv // NV, i_kv % NV
@@ -447,7 +448,7 @@ def parallel_simple_gla_bwd_kernel(
         BS=BS,
         BK=BK,
         BV=BV,
-        USE_G=USE_G
+        USE_G=USE_G,
     )
     tl.debug_barrier()
     parallel_simple_gla_bwd_kernel_dkv(
@@ -471,7 +472,7 @@ def parallel_simple_gla_bwd_kernel(
         BS=BS,
         BK=BK,
         BV=BV,
-        USE_G=USE_G
+        USE_G=USE_G,
     )
 
 
@@ -483,7 +484,7 @@ def parallel_simple_gla_fwd(
     scale: float,
     output_attentions: bool = False,
     chunk_size: int = 128,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT, BS = chunk_size, 32
@@ -546,7 +547,7 @@ def parallel_simple_gla_bwd(
     do: torch.Tensor,
     scale: float,
     chunk_size: int = 128,
-    cu_seqlens: Optional[torch.LongTensor] = None,
+    cu_seqlens: torch.LongTensor | None = None,
 ):
     B, T, H, K, V = *k.shape, v.shape[-1]
     BT, BS = chunk_size, 32
@@ -652,12 +653,12 @@ def parallel_simple_gla(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
     output_attentions: bool = False,
-    cu_seqlens: Optional[torch.LongTensor] = None,
-    head_first: bool = False
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    cu_seqlens: torch.LongTensor | None = None,
+    head_first: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
         q (torch.Tensor):
@@ -690,20 +691,20 @@ def parallel_simple_gla(
     if head_first:
         raise DeprecationWarning(
             "head_first is deprecated and will be removed in a future version. "
-            "Please use head_first=False for now instead."
+            "Please use head_first=False for now instead.",
         )
     if not head_first and q.shape[1] < q.shape[2]:
         warnings.warn(
             f"Input tensor shape suggests potential format mismatch: seq_len ({q.shape[1]}) < num_heads ({q.shape[2]}). "
             "This may indicate the inputs were passed in head-first format [B, H, T, ...] "
             "when head_first=False was specified. "
-            "Please verify your input tensor format matches the expected shape [B, T, H, ...]."
+            "Please verify your input tensor format matches the expected shape [B, T, H, ...].",
         )
     if cu_seqlens is not None:
         if q.shape[0] != 1:
             raise ValueError(
                 f"The batch size is expected to be 1 rather than {q.shape[0]} when using `cu_seqlens`."
-                f"Please flatten variable-length inputs before processing."
+                f"Please flatten variable-length inputs before processing.",
             )
     if output_attentions:
         assert cu_seqlens is None, "output_attentions=True is not supported with variable-length sequences"
@@ -717,6 +718,6 @@ def parallel_simple_gla(
         g,
         scale,
         output_attentions,
-        cu_seqlens
+        cu_seqlens,
     )
     return o, attn

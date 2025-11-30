@@ -1,14 +1,10 @@
-# -*- coding: utf-8 -*-
 
 import pytest
 import torch
-from transformers import AutoModelForCausalLM
 
 from fla.models import TransformerConfig
-from fla.utils import device
 
 from .test_modeling_base import run_test_generation, run_test_model_forward_backward
-from .test_modeling_utils import init_weights_recursively
 
 
 # ===================================================================================
@@ -23,7 +19,7 @@ from .test_modeling_utils import init_weights_recursively
             (4, 4, 1024, 4, 64, False, torch.bfloat16),
             (4, 4, 1024, 4, 128, False, torch.bfloat16),
         ]
-    ]
+    ],
 )
 def test_modeling(
     L: int,
@@ -47,7 +43,7 @@ def test_modeling(
         for test in [
             (2, 4, 2000, 8, 64, torch.float16),
         ]
-    ]
+    ],
 )
 def test_generation(
     L: int,
@@ -57,19 +53,4 @@ def test_generation(
     D: int,
     dtype: torch.dtype,
 ):
-    config = TransformerConfig()
-    config.num_hidden_layers = L
-    config.num_heads = H
-    config.hidden_size = H * D
-    config.head_dim = D
-
-    model = AutoModelForCausalLM.from_config(config)
-    model.apply(init_weights_recursively)
-    model = model.to(dtype).to(device)
-    run_test_generation(L, B, T, H, D, TransformerConfig, dtype, model=model, config=config, tol=7e-3)
-
-    config.window_size = 100
-    model = AutoModelForCausalLM.from_config(config)
-    model.apply(init_weights_recursively)
-    model = model.to(dtype).to(device)
-    run_test_generation(L, B, T, H, D, TransformerConfig, dtype, model=model, config=config, tol=7e-3)
+    run_test_generation(L, B, T, H, D, TransformerConfig, dtype)

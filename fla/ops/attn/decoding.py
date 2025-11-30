@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 
-from typing import Optional
 
 import torch
 import triton
@@ -9,11 +7,11 @@ import triton.language as tl
 
 from fla.ops.utils.cumsum import chunk_global_cumsum
 from fla.ops.utils.op import exp
-from fla.utils import check_shared_mem
+from fla.utils import autotune_cache_kwargs, check_shared_mem
 
 
 @triton.heuristics({
-    'USE_G': lambda args: args['g_cumsum'] is not None
+    'USE_G': lambda args: args['g_cumsum'] is not None,
 })
 @triton.autotune(
     configs=[
@@ -22,6 +20,7 @@ from fla.utils import check_shared_mem
         for num_stages in [2, 3, 4, 5]
     ],
     key=['H', 'G', 'K', 'V', 'BK', 'BV', 'USE_G'],
+    **autotune_cache_kwargs,
 )
 @triton.jit
 def naive_attn_decoding_kernel(
@@ -43,7 +42,7 @@ def naive_attn_decoding_kernel(
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
-    USE_G: tl.constexpr
+    USE_G: tl.constexpr,
 ):
     i_v, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -58,10 +57,10 @@ def naive_attn_decoding_kernel(
     b_q = tl.load(p_q, boundary_check=(0,))
     b_q = (b_q * scale).to(b_q.dtype)
 
-    b_o = tl.zeros([BV, ], dtype=tl.float32)
+    b_o = tl.zeros([BV ], dtype=tl.float32)
 
-    b_m = tl.full([1,], float('-inf'), dtype=tl.float32)
-    b_acc = tl.zeros([1,], dtype=tl.float32)
+    b_m = tl.full([1], float('-inf'), dtype=tl.float32)
+    b_acc = tl.zeros([1], dtype=tl.float32)
 
     if USE_G:
         p_g = tl.make_block_ptr(g_cumsum + bos * HQ + i_hq, (T,), (HQ,), (T-1,), (1,), (0,))
@@ -105,8 +104,8 @@ def attn_decoding_one_step(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
+    g: torch.Tensor | None = None,
+    scale: float | None = None,
     cu_seqlens: torch.LongTensor = None,
     do_gate_scale: bool = False,
 ):
@@ -143,7 +142,7 @@ def attn_decoding_one_step(
     if scale is None:
         scale = K ** -0.5
 
-    BK = triton.next_power_of_2(K)
+    BK = max(triton.next_power_of_2(K), 16)
     if check_shared_mem('hopper', q.device.index):
         BS = min(64, max(16, triton.next_power_of_2(T)))
         BV = min(256, max(16, triton.next_power_of_2(V)))

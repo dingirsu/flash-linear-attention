@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 
 import math
 
@@ -24,6 +23,7 @@ HOPPER_EXCLUSIVE = []
 GENERATION_UNSUPPORTED = [
     "ABCConfig", "LinearAttentionConfig", "LightNetConfig",
     "Mamba2Config", "MambaConfig", "NSAConfig", "SambaConfig", "RWKV6Config", "RWKV7Config",
+    "DeltaFormerConfig",
 ]
 
 
@@ -35,7 +35,7 @@ def create_model_and_config(config_class, L, H, D, dtype, **kwargs):
         'hidden_size': H * D,
         'num_hidden_layers': L,
         **({'num_heads': H} if config_class.__name__ != 'NSAConfig' else {}),
-        **kwargs
+        **kwargs,
     }
     config = config_class(**config_params)
     model = AutoModelForCausalLM.from_config(config)
