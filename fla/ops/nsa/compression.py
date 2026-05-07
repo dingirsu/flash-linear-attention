@@ -1,5 +1,9 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import triton
@@ -229,7 +233,7 @@ def parallel_nsa_compression_bwd_kernel_dq(
     key=['BS', 'BK', 'BV'],
     **autotune_cache_kwargs,
 )
-@triton.jit(do_not_specialize=['T'])
+@triton.jit(do_not_specialize=['T', 'TC'])
 def parallel_nsa_compression_bwd_kernel_dkv(
     q,
     k,
@@ -244,6 +248,7 @@ def parallel_nsa_compression_bwd_kernel_dkv(
     chunk_offsets,
     scale,
     T,
+    TC,
     B: tl.constexpr,
     H: tl.constexpr,
     HQ: tl.constexpr,
@@ -259,23 +264,23 @@ def parallel_nsa_compression_bwd_kernel_dkv(
     i_v, i_c, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
 
-    all = B * T
+    all = B * TC
+
     if IS_VARLEN:
         i_n, i_c = tl.load(chunk_indices + i_c * 2).to(tl.int32), tl.load(chunk_indices + i_c * 2 + 1).to(tl.int32)
         bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
         T = eos - bos
+        # the number of compression representations in total
+        TC = tl.cdiv(T, BS)
         boc = tl.load(chunk_offsets + i_n).to(tl.int32)
     else:
         bos, eos = i_b * T, i_b * T + T
         boc = i_b * tl.cdiv(T, BS)
 
-    # the number of compression representations in total
-    TC = tl.cdiv(T, BS)
-
     p_k = tl.make_block_ptr(k + (boc * H + i_h) * K, (TC, K), (H*K, 1), (i_c * BC, 0), (BC, BK), (1, 0))
     p_v = tl.make_block_ptr(v + (boc * H + i_h) * V, (TC, V), (H*V, 1), (i_c * BC, i_v * BV), (BC, BV), (1, 0))
     p_dk = tl.make_block_ptr(dk + (i_v * all*H + boc * H + i_h) * K, (TC, K), (H*K, 1), (i_c * BC, 0), (BC, BK), (1, 0))
-    p_dv = tl.make_block_ptr(dv + (i_v * all*H + boc * H + i_h) * V, (TC, V), (H*V, 1), (i_c * BC, i_v * BV), (BC, BV), (1, 0))
+    p_dv = tl.make_block_ptr(dv + (boc * H + i_h) * V, (TC, V), (H*V, 1), (i_c * BC, i_v * BV), (BC, BV), (1, 0))
 
     # [BC, BK]
     b_k = tl.load(p_k, boundary_check=(0, 1))
@@ -381,8 +386,10 @@ def parallel_nsa_compression_bwd(
     scale: float = None,
     cu_seqlens: torch.LongTensor | None = None,
     token_indices: torch.LongTensor | None = None,
+    chunk_indices: torch.LongTensor | None = None,
 ):
     B, T, HQ, K, V = *q.shape, v.shape[-1]
+    TC = k.shape[1]
     H = k.shape[2]
     G = HQ // H
     BC = BS = block_size
@@ -390,7 +397,9 @@ def parallel_nsa_compression_bwd(
     BV = min(128, max(triton.next_power_of_2(v.shape[-1]), 16))
     NV = triton.cdiv(V, BV)
     if cu_seqlens is not None:
-        chunk_indices, chunk_offsets = prepare_chunk_indices(cu_seqlens, BS), prepare_chunk_offsets(cu_seqlens, BS)
+        chunk_offsets = prepare_chunk_offsets(cu_seqlens, BS)
+        if chunk_indices is None:
+            chunk_indices = prepare_chunk_indices(chunk_offsets, BC)
         NC = len(chunk_indices)
     else:
         chunk_indices, chunk_offsets = None, None
@@ -444,6 +453,7 @@ def parallel_nsa_compression_bwd(
         chunk_offsets=chunk_offsets,
         scale=scale,
         T=T,
+        TC=TC,
         B=B,
         H=H,
         HQ=HQ,

@@ -1,4 +1,9 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 """ Implementing the Deepseek Multi Latent Attention (MLA) module. Reference:
 
@@ -93,7 +98,7 @@ class MultiheadLatentAttention(nn.Module):
         if q_lora_rank is not None:
             self.q_proj = nn.Sequential(
                 nn.Linear(hidden_size, q_lora_rank, bias=False),
-                RMSNorm(q_lora_rank),
+                RMSNorm(q_lora_rank, dtype=torch.float32),
                 nn.Linear(q_lora_rank, self.num_heads * self.qk_head_dim, bias=False),
             )
         else:
@@ -102,14 +107,14 @@ class MultiheadLatentAttention(nn.Module):
         self.k_rope = nn.Linear(hidden_size, self.qk_rope_head_dim, bias=False)
         self.kv_proj = nn.Sequential(
             nn.Linear(hidden_size, self.kv_lora_rank, bias=False),
-            RMSNorm(self.kv_lora_rank),
+            RMSNorm(self.kv_lora_rank, dtype=torch.float32),
             nn.Linear(self.kv_lora_rank, self.num_heads * (self.qk_nope_head_dim + self.v_head_dim), bias=False),
         )
 
         self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, hidden_size, bias=False)
 
         self.scaling = self.qk_head_dim ** (-0.5)
-        if rope_scaling is not None:
+        if rope_scaling is not None and rope_scaling.get("rope_type", "default") != "default":
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 0)
             scaling_factor = rope_scaling["factor"]
             if mscale_all_dim:

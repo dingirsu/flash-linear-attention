@@ -1,3 +1,10 @@
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
+
 from .cumsum import (
     chunk_global_cumsum,
     chunk_global_cumsum_scalar,
@@ -13,7 +20,6 @@ from .index import (
     prepare_cu_seqlens_from_lens,
     prepare_cu_seqlens_from_mask,
     prepare_lens,
-    prepare_lens_from_cu_seqlens,
     prepare_lens_from_mask,
     prepare_position_ids,
     prepare_sequence_ids,
@@ -45,7 +51,6 @@ __all__ = [
     "prepare_cu_seqlens_from_lens",
     "prepare_cu_seqlens_from_mask",
     "prepare_lens",
-    "prepare_lens_from_cu_seqlens",
     "prepare_lens_from_mask",
     "prepare_position_ids",
     "prepare_sequence_ids",

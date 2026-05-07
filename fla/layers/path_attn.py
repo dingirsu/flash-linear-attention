@@ -1,4 +1,9 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 from __future__ import annotations
 
@@ -66,8 +71,8 @@ class PaTHAttention(nn.Module):
 
         # per head norm
         if use_qk_norm:
-            self.maybe_q_norm = RMSNorm(self.head_dim)
-            self.maybe_k_norm = RMSNorm(self.head_dim)
+            self.maybe_q_norm = RMSNorm(self.head_dim, dtype=torch.float32)
+            self.maybe_k_norm = RMSNorm(self.head_dim, dtype=torch.float32)
         else:
             self.maybe_q_norm = nn.Identity()
             self.maybe_k_norm = nn.Identity()

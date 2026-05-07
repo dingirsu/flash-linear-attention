@@ -1,10 +1,16 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2023-2026, Songlin Yang, Yu Zhang, Zhiyuan Li
+#
+# This source code is licensed under the MIT license found in the
+# LICENSE file in the root directory of this source tree.
+# For a list of all contributors, visit:
+#   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
 
+from fla.ops.utils.cache import fla_cache_autotune
 from fla.utils import IS_AMD, autotune_cache_kwargs, input_guard
 
 BT_LIST = [8, 16, 32, 64, 128]
@@ -12,11 +18,8 @@ NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
-    key=['D'],
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -43,11 +46,8 @@ def l2norm_fwd_kernel1(
 
 
 @triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=num_warps)
-        for num_warps in NUM_WARPS_AUTOTUNE
-    ],
-    key=['D'],
+    configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
+    key=["D"],
     **autotune_cache_kwargs,
 )
 @triton.jit
@@ -74,22 +74,18 @@ def l2norm_bwd_kernel1(
     tl.store(dx + cols, b_dx, mask=mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
-    key=['D', 'NB'],
+@fla_cache_autotune(
+    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
+    key=["D", "NB"],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_fwd_kernel(
     x,
     y,
     rstd,
     eps,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
@@ -108,23 +104,19 @@ def l2norm_fwd_kernel(
     tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BT': BT}, num_warps=num_warps)
-        for num_warps in [1, 2, 4, 8, 16]
-        for BT in BT_LIST
-    ],
-    key=['D', 'NB'],
+@fla_cache_autotune(
+    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
+    key=["D", "NB"],
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T"])
 def l2norm_bwd_kernel(
     y,
     rstd,
     dy,
     dx,
     eps,
-    T: tl.constexpr,
+    T,
     D: tl.constexpr,
     BD: tl.constexpr,
     NB: tl.constexpr,
@@ -165,8 +157,14 @@ def l2norm_fwd(
 
     rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
-        def grid(meta): return (triton.cdiv(T, meta['BT']), )
+        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
+        # of T before recompiling the kernel.
+        # NB = triton.cdiv(T, 2048)
+        NB = triton.cdiv(T, 2048 * 32)
+
+        def grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
         l2norm_fwd_kernel[grid](
             x=x,
             y=y,
@@ -209,8 +207,14 @@ def l2norm_bwd(
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
 
     if D <= 512:
-        NB = triton.cdiv(T, 2048)
-        def grid(meta): return (triton.cdiv(T, meta['BT']), )
+        # NOTE(tylerr): Avoid excessive recompilation and autotuning by tolerating a larger range
+        # of T before recompiling the kernel.
+        # NB = triton.cdiv(T, 2048)
+        NB = triton.cdiv(T, 2048 * 32)
+
+        def grid(meta):
+            return (triton.cdiv(T, meta["BT"]),)
+
         l2norm_bwd_kernel[grid](
             y=y,
             rstd=rstd,
@@ -237,7 +241,6 @@ def l2norm_bwd(
 
 
 class L2NormFunction(torch.autograd.Function):
-
     @staticmethod
     @input_guard
     def forward(
@@ -272,7 +275,6 @@ l2_norm = l2norm
 
 
 class L2Norm(nn.Module):
-
     def __init__(
         self,
         eps: float = 1e-6,
